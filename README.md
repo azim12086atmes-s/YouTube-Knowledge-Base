@@ -35,7 +35,7 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Ask a question across the entire corpus | ✓ (`ask.py --all`) |
 | Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
-| Vector store / semantic search | ✗ — gated on corpus > 200 KB or a real query failing bundle-and-ask. Design + cost in `docs/SEMANTIC-SEARCH.md`. |
+| Vector store / semantic search | ✓ — `sqlite-vec` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim). `ask.py --all` uses cosine top-k; explicit-URL mode falls back to bundle-and-ask when the index has no embeddings. |
 | Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
 | Push trigger from YouTube webhooks | ✗ — gated on a real external process |
 | Headless-browser auto-fetch of similar videos | ✗ — rung-1 reject (YouTube ToS) |
@@ -48,7 +48,8 @@ git clone <repo-url> video-pipeline
 cd video-pipeline
 
 # 2. Python deps — stdlib + google-genai + youtube-transcript-api
-pip install google-genai youtube-transcript-api
+#    + sentence-transformers + sqlite-vec (for vector search, ~250 MB on disk)
+pip install google-genai youtube-transcript-api sentence-transformers sqlite-vec
 
 # 3. API key
 echo 'GEMINI_API_KEY=YOUR_KEY_HERE' >> ~/.hermes/.env
@@ -56,6 +57,9 @@ echo 'GEMINI_API_KEY=YOUR_KEY_HERE' >> ~/.hermes/.env
 
 # 4. (Optional) Drop a Google Takeout zip in ~/Downloads/
 #    go to https://takeout.google.com → YouTube → history → JSON format
+
+# 5. (Optional) Backfill embeddings from existing transcripts:
+#    python bin/analyze.py --reindex-from-md
 ```
 
 The scripts assume:
