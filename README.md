@@ -35,7 +35,7 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Ask a question across the entire corpus | ✓ (`ask.py --all`) |
 | Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
-| Vector store / semantic search | ✗ — gated on corpus size + a real query failing bundle-and-ask |
+| Vector store / semantic search | ✗ — gated on corpus > 200 KB or a real query failing bundle-and-ask. Design + cost in `docs/SEMANTIC-SEARCH.md`. |
 | Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
 | Push trigger from YouTube webhooks | ✗ — gated on a real external process |
 | Headless-browser auto-fetch of similar videos | ✗ — rung-1 reject (YouTube ToS) |
@@ -146,6 +146,7 @@ caption extraction).
 | `docs/CONVENTIONS.md` | The Markdown front-matter schema. What fields every `<slug>.md` must have. |
 | `docs/REQUIREMENTS.md` | Status of every feature: built, deferred, rejected. Each deferred item names its trigger. |
 | `docs/ANALYSIS-FALLBACK.md` | Why shorts fail to analyze today. 3-tier fallback design (transcript → multimodal audio → local STT). |
+| `docs/SEMANTIC-SEARCH.md` | Why `ask.py` doesn't do semantic search today, what it costs to add, and the trigger that earns the build. |
 
 Read `REQUIREMENTS.md` first if you want to know what's *not* built and why.
 
