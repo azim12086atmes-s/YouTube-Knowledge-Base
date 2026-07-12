@@ -418,6 +418,15 @@ def process_one(api_key: str, slug: str, watched_at: str, out_dir: Path,
             return 1
         # Save the transcript for re-use.
         (out_dir / f"{slug}.transcript.txt").write_text(transcript, encoding="utf-8")
+        # ponytail: embed for semantic search on the same SQLite connection.
+        # ~50 ms on CPU; idempotent on re-runs (upsert_chunks deletes prior).
+        if index_conn is not None:
+            try:
+                from vector_store import upsert_chunks
+                n = upsert_chunks(index_conn, slug, transcript)
+                print(f"  embed: {n} chunks stored", file=sys.stderr)
+            except Exception as e:
+                print(f"  embed: skipped ({type(e).__name__}: {e})", file=sys.stderr)
 
     for shape, prompt in prompts.items():
         if mode == "multimodal":
@@ -505,6 +514,18 @@ def main() -> int:
                             "transcript" if (mode_m and "transcript" in mode_m.group(1).lower())
                                        else "multimodal",
                             "ok", p)
+            # ponytail: if a transcript sidecar exists, embed it too. Public-clone
+            # users get the vector index populated without running analyze on each URL.
+            tpath = args.out / f"{slug_m.group(1)}.transcript.txt"
+            if tpath.exists():
+                try:
+                    from vector_store import upsert_chunks
+                    n = upsert_chunks(index_conn, slug_m.group(1),
+                                      tpath.read_text(encoding="utf-8"))
+                    print(f"  embed: {slug_m.group(1)} -> {n} chunks", file=sys.stderr)
+                except Exception as e:
+                    print(f"  embed: skipped {slug_m.group(1)} "
+                          f"({type(e).__name__}: {e})", file=sys.stderr)
             updated += 1
         # ponytail: remove prior bogus rows. Real YT IDs are mixed-case +
         # alphanumeric; pure-uppercase / pure-lower is unusual. Cheap filter.

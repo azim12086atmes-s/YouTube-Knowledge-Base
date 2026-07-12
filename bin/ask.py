@@ -147,10 +147,51 @@ def main() -> int:
     if not transcripts:
         print("error: no transcripts found", file=sys.stderr); return 1
 
-    print(f"# ask: {len(transcripts)} transcripts, "
-          f"{sum(len(t) for t in transcripts)} chars total", file=sys.stderr)
-
     api_key = gemini_key()
+
+    # ponytail: retrieval is cheaper when the corpus is large. Three modes:
+    #   --all            → always use vector_store.search() (top-k chunks)
+    #   explicit urls    → use vector_store.search() if chunks exist for them,
+    #                       fall back to bundle-and-ask otherwise
+    #   small corpus     → bundle-and-ask (no retrieval overhead)
+    corpus_bytes = sum(len(t) for t in transcripts)
+    use_retrieval = args.all or corpus_bytes > 60_000
+    if use_retrieval:
+        try:
+            from vector_store import search as vec_search
+            from pathlib import Path as _P
+            idx_path = _P(args.transcripts_dir) / "analyzed.sqlite"
+            if not idx_path.exists():
+                print(f"warn: no vector index at {idx_path}; "
+                      f"falling back to bundle-and-ask. run analyze.py on "
+                      f"transcripts to populate embeddings.", file=sys.stderr)
+                use_retrieval = False
+            else:
+                import sqlite3
+                idx_conn = sqlite3.connect(str(idx_path))
+                hits = vec_search(idx_conn, args.question, k=10)
+                idx_conn.close()
+                if hits:
+                    slugs = [h["slug"] for h in hits]
+                    transcripts = [h["text"] for h in hits]
+                    print(f"# ask: retrieval -> {len(hits)} chunks, "
+                          f"{sum(len(t) for t in transcripts)} chars",
+                          file=sys.stderr)
+                else:
+                    # Index has embeddings but none match — bundle fallback
+                    # so the model can still see *something* from each slug.
+                    print("# ask: retrieval empty; bundle-and-ask fallback",
+                          file=sys.stderr)
+                    use_retrieval = False
+        except Exception as e:
+            print(f"# ask: retrieval failed ({type(e).__name__}: {e}); "
+                  f"bundle-and-ask fallback", file=sys.stderr)
+            use_retrieval = False
+
+    if not use_retrieval:
+        print(f"# ask: bundle-and-ask, {len(transcripts)} transcripts, "
+              f"{corpus_bytes} chars total", file=sys.stderr)
+
     response = ask(args.question, transcripts, slugs, api_key)
     if response.startswith("ERROR"):
         print(response, file=sys.stderr); return 2
