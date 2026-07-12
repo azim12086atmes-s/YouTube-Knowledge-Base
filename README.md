@@ -15,13 +15,10 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 ## What this is *not*
 
 * Not a hosted service. Runs entirely on your machine.
-* Not a vector store or semantic-search engine. Asks questions by bundling
-  transcripts into one prompt (~60 KB max). Sufficient for ≤50 transcripts;
-  for larger corpora, the bundle approach will hit limits and a vector store
-  will be the next rung.
 * Not a video downloader / scraper. Reads what already exists in a Takeout
   zip.
-* Not a chat app. There's a CLI question (`ask.py`), not a chat UI.
+* Not a multi-turn chat UI. `ask.py` is one-shot Q&A over the corpus;
+  there's no conversation memory or chat-style interface.
 
 ## What it does today
 
@@ -35,6 +32,8 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Ask a question across the entire corpus | ✓ (`ask.py --all`) |
 | Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
+| Chat interface (multi-turn, conversation memory, UI) | ✗ — gated on a real question that needs back-and-forth; today `ask.py --question "..."` is single-shot |
+| Query raw transcript chunks verbatim | ✓ — `ask.py --show-chunks` prints top-k retrieved excerpts with slug + cosine distance before the LLM answer |
 | Vector store / semantic search | ✓ — `sqlite-vec` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim). `ask.py --all` uses cosine top-k; explicit-URL mode falls back to bundle-and-ask when the index has no embeddings. |
 | Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
 | Push trigger from YouTube webhooks | ✗ — gated on a real external process |
@@ -105,6 +104,17 @@ python bin/ask.py --all --question "what themes run across my watched videos?"
 
 Honest refusal is built in — if no transcript addresses your question, the
 model will say so rather than confabulate.
+
+To see the *raw* retrieved transcript excerpts (slug + cosine distance +
+verbatim text) before the LLM answer:
+
+```bash
+python bin/ask.py --all --question "conscience and war" --show-chunks
+```
+
+Useful when the LLM-rendered answer loses detail that the raw chunk
+preserves, or when you want to quote a video directly without going
+through the model.
 
 ### What channels do I watch most?
 
