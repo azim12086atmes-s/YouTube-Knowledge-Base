@@ -118,6 +118,9 @@ def main() -> int:
                    help="ask across every <slug>.transcript.txt in --transcripts-dir")
     p.add_argument("--question", required=True,
                    help="question to ask across the chosen transcripts")
+    p.add_argument("--show-chunks", action="store_true",
+                   help="print the top-k retrieved chunks (raw transcript excerpts) "
+                        "before the LLM answer; useful for verifying retrieval quality")
     p.add_argument("--transcripts-dir", type=Path, default=DEFAULT_TRANSCRIPT_DIR,
                    help=f"directory holding <slug>.transcript.txt sidecars "
                         f"(default: {DEFAULT_TRANSCRIPT_DIR})")
@@ -191,6 +194,15 @@ def main() -> int:
     if not use_retrieval:
         print(f"# ask: bundle-and-ask, {len(transcripts)} transcripts, "
               f"{corpus_bytes} chars total", file=sys.stderr)
+
+    # ponytail: --show-chunks prints raw retrieved excerpts to stdout BEFORE
+    # the LLM answer. Lets the user verify retrieval quality or quote the
+    # raw transcript directly without going through the model.
+    if args.show_chunks and "hits" in locals() and hits:
+        print("# retrieved chunks:")
+        for i, h in enumerate(hits, 1):
+            print(f"\n## {i}. {h['slug']} (distance={h['distance']:.3f})")
+            print(h["text"].strip())
 
     response = ask(args.question, transcripts, slugs, api_key)
     if response.startswith("ERROR"):
