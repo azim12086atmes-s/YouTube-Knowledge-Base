@@ -1,0 +1,16 @@
+# Symlink to user's actual corpus location
+corpus/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local state
+*.sqlite
+*.sqlite-journal
+pipeline-state.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
