@@ -27,6 +27,11 @@ These are **explicitly NOT built today**. Each has a trigger — do not implemen
 | D11 | **Multi-format URL ingest** (xlsx, txt, jsonl URL lists) | ✓ **Shipped 2026-07-13**: `--source xlsx | urlfile` on `url_source.py`, forwarded via `pipeline.py --source`. Stdlib-only (zipfile + ElementTree). |
 | D12 | **Corpus inventory CLI** (`bin/list.py` ~100 LOC) | ✓ **Shipped 2026-07-13**: `--mode`, `--tag` (union), `--outcome`, `--limit` filters against `analyzed_videos` + `tag_assignments` tables. Surfaces what's in the corpus + which slugs match each tag. |
 | D13 | **chat.py :tag REPL command** (parity with `ask.py --tag`) | ✓ **Shipped 2026-07-13**: per-session active tag filter persisted in `session_state` table. `:tag [name]` sets, `:tag` shows, future `:tag clear` resets. Retrieval re-ranks to top-k inside the active slugs. |
+| D14 | **Multimodal-mode classification** (no-transcript tagger) | ✓ **Shipped 2026-07-13**: `analyze.py --reclassify-from-md` reads `## 1. Summary` + `## 2. Key Takeaways` markdown sections, classifies via `classify_text(kind="analysis-body")`. Skips already-tagged unless `--reclassify` also passed. 5 multimodal-only files tagged. |
+| D15 | **`--retry-skips`** (re-run every skip row) | ✓ **Shipped 2026-07-13**: `analyze.py --retry-skips` iterates `outcome LIKE 'skip%'`, calls `process_one()` on each. Idempotent on writes (dedup), real probe on no-signal skips. Captions sometimes re-appear; cheap to re-check daily. |
+| D16 | **Shared Gemini POST helper** (dedup across `analyze.py` / `ask.py` / `chat.py`) | ✓ **Shipped 2026-07-13**: `bin/_gemini.py` with `gemini_key()`, `post()`, `post_text()`. Three callers route through one function. Back-compat `gemini_key = _gemini_key` shims in each caller. |
+| D17 | **`takeout_sample.py` back-compat shim** (was a stale fork) | ✓ **Shipped 2026-07-13**: replaced stale duplicate with `from url_source import *` shim. README/project shape continues to reference both names. |
+| D18 | **`sample(n=1)` div-by-zero** (pre-existing latent bug in `url_source.py`) | ✓ **Fixed 2026-07-13**: explicit `n == 1` early-return so `--n 1` returns the latest-month entry instead of crashing on `n-1` divisor. |
 
 ## What we explicitly rejected today
 

@@ -273,6 +273,11 @@ def sample(records: list[dict], n: int) -> list[dict]:
     months = sorted(buckets.keys())
     if not months:
         return []
+    # ponytail: degenerate case — n=1 means "give me one". Avoid div-by-zero
+    # in the stride formula; just return the last record of the latest month.
+    if n == 1:
+        picks = [buckets[months[-1]][-1]]
+        return picks
     if len(months) >= n:
         idx = sorted({i * (len(months) - 1) // (n - 1) for i in range(n)})
     else:

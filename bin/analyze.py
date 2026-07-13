@@ -31,17 +31,21 @@ What's NOT in this script (rung-1 avoided):
 from __future__ import annotations
 import argparse
 import base64
-import json
 import os
 import re
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-import urllib.parse
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse as _urlparse  # ponytail: used only by --retry-skips
+from _gemini import (gemini_key as _gemini_key,
+                     post_text as _gemini_post_text,
+                     post as _gemini_post)
+
+# ponytail: back-compat shim. Real helper lives in _gemini.py.
+gemini_key = _gemini_key
+
 
 # ponytail: v1 stays inline. If conventions change, lift these to a shared module.
 PROMPTS_MULTIMODAL = {
@@ -176,30 +180,19 @@ def record_analyzed(conn: "sqlite3.Connection", slug: str, url: str,
     conn.commit()
 
 
-def gemini_key() -> str:
-    env_path = Path.home() / "AppData" / "Local" / "hermes" / ".env"
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("GEMINI_API_KEY="):
-            return line.split("=", 1)[1]
-    raise SystemExit("GEMINI_API_KEY missing from ~/.hermes/.env — pause and ask.")
+# ponytail: shim for callers importing this module.
+def gemini_key_local():
+    return _gemini_key()
 
 
 def _post(model: str, api_key: str, body: dict, timeout: int = 180) -> str:
-    """POST a generateContent body. Returns text or 'ERROR <code>: ...'."""
-    url = f"{GEMINI_URL}/{model}:generateContent?key={api_key}"
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read())
-            parts = data["candidates"][0]["content"].get("parts") or []
-            text = "".join(p.get("text", "") for p in parts)
-            return text or "ERROR EMPTY_PARTS"
-    except urllib.error.HTTPError as e:
-        return f"ERROR {e.code}: {e.read().decode()[:300]}"
-    except Exception as e:
-        return f"ERROR {type(e).__name__}: {e}"
-
+    # ponytail: thin wrapper — real POST lives in _gemini.py. Keeps the
+    # local _post() signature so internal callers don't need changes.
+    contents = body.get("contents", [])
+    out = _gemini_post(contents, api_key, model, timeout=timeout)
+    if out == "(empty response)":
+        return "ERROR EMPTY_PARTS"
+    return out
 
 def call_gemini_multimodal(api_key: str, video_url: str, prompt: str,
                             max_retries: int = 3, base_delay: float = 4.0) -> str:
@@ -249,18 +242,28 @@ def call_gemini_text(api_key: str, prompt: str, transcript: str,
     return result  # last error
 
 
-# ponytail: classify a transcript into the fixed vocabulary.
-# Cheap (one short Gemini call, 32 max output tokens, ~1s wall).
-# Returns a list of tag strings (deduped, stripped).
-def classify_transcript(api_key: str, transcript: str,
-                        vocab: tuple[str, ...]) -> list[str]:
+# ponytail: classify any text into the fixed vocabulary. Parameterized so
+# callers can pass either a transcript or the markdown analysis body.
+# Cheap (one short Gemini call, ~1s wall).
+def classify_text(api_key: str, text: str,
+                  vocab: tuple[str, ...],
+                  kind: str = "transcript") -> list[str]:
+    """kind ∈ {"transcript", "analysis-body"} — adjusts the prompt framing."""
     vocab_str = ", ".join(f"\"{t}\"" for t in vocab)
+    if kind == "transcript":
+        src_intro = "You classify YouTube transcripts. The transcript is below."
+        src_label = "Transcript"
+    else:
+        src_intro = ("You classify YouTube videos based on the analysis below. "
+                     "The analysis was produced by another model from the video; "
+                     "reason about it as if summarizing a watched video.")
+        src_label = "Analysis"
     prompt = (
-        f"You classify YouTube transcripts. The transcript is below.\n\n"
+        f"{src_intro}\n\n"
         f"Pick 1-3 tags from this fixed vocabulary that describe the topic(s):\n"
         f"{vocab_str}\n\n"
         f"Output ONLY a JSON array of strings. Nothing else. Example: [\"ai-tooling\"]\n\n"
-        f"Transcript:\n```\n{transcript[:20_000]}\n```"
+        f"{src_label}:\n```\n{text[:20_000]}\n```"
     )
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -269,7 +272,6 @@ def classify_transcript(api_key: str, transcript: str,
     result = _post(GEMINI_TEXT_MODEL, api_key, body, timeout=60)
     if result.startswith("ERROR"):
         return []
-    # ponytail: extract the JSON array. Tolerate ```json fences.
     import re
     m = re.search(r"\[([^\[\]]*)\]", result)
     if not m:
@@ -285,6 +287,13 @@ def classify_transcript(api_key: str, transcript: str,
         seen.add(p)
         out.append(p)
     return out
+
+
+# ponytail: back-compat alias used by --reclassify. classify_text() with the
+# default kind="transcript" is identical to the old classify_transcript().
+def classify_transcript(api_key: str, transcript: str,
+                        vocab: tuple[str, ...]) -> list[str]:
+    return classify_text(api_key, transcript, vocab)
 
 
 
@@ -544,6 +553,18 @@ def main() -> int:
     p.add_argument("--reclassify", action="store_true",
                    help="iterate every markdown file in --out and (re-)classify it "
                         "without re-running the 4-shape analysis; updates front-matter + tag_assignments")
+    p.add_argument("--reclassify-from-md", action="store_true",
+                   help="same as --reclassify but classifies from the markdown body "
+                        "(Summary + Key Takeaways sections) instead of the transcript "
+                        "sidecar. Use this for multimodal-mode files that have no "
+                        ".transcript.txt. Skips any file that already has tags unless "
+                        "--reclassify is also passed (then forces overwrite).")
+    p.add_argument("--retry-skips", action="store_true",
+                   help="iterate every slug in the index whose outcome starts with "
+                        "'skip' and re-run process_one() on it. Useful because "
+                        "uploader captions sometimes re-appear days after the "
+                        "first try. Idempotent: when an analyze write happens "
+                        "the row updates; when no signal surfaces, it stays.")
     args = p.parse_args()
 
     mode = "transcript" if args.transcript else "multimodal"
@@ -615,27 +636,86 @@ def main() -> int:
     # ponytail: --reclassify iterates every markdown file in --out that has
     # a transcript sidecar, classifies via Gemini, and writes tags back to
     # front-matter + tag_assignments. No re-running of the 4-shape analysis.
-    if getattr(args, "reclassify", False):
+    if getattr(args, "reclassify", False) or getattr(args, "reclassify_from_md", False):
         from vector_store import set_tags as _set_tags
+        from vector_store import get_tags as _get_tags
         import re as _re
+        from vector_store import TAG_VOCAB as _VOCAB
         slug_re = _re.compile(r"^([A-Za-z0-9_-]{11})\.md$")
         files = sorted(p for p in args.out.glob("*.md")
                        if slug_re.match(p.name))
         print(f"# reclassify: {len(files)} candidate files", file=sys.stderr)
-        from vector_store import TAG_VOCAB as _VOCAB
+        force = getattr(args, "reclassify", False)
+        use_body = getattr(args, "reclassify_from_md", False) and not force
         for p in files:
             slug = slug_re.match(p.name).group(1)
-            tpath = args.out / f"{slug}.transcript.txt"
-            if not tpath.exists():
-                print(f"  skip {slug}: no transcript sidecar", file=sys.stderr)
+            text = ""
+            kind = "transcript"
+            if use_body:
+                # ponytail: multimodal-mode files have no transcript sidecar.
+                # Read Summary + Key Takeaways from the markdown body instead.
+                full = p.read_text(encoding="utf-8")
+                # Take the prose between "## 1. Summary" and "## 2. Key Takeaways"
+                # (and before "## 3."), max ~15k chars per section.
+                m1 = _re.search(r"##\s*1\.\s*Summary\s*\n(.*?)(?=\n##\s|\Z)",
+                                full, _re.S)
+                m2 = _re.search(r"##\s*2\.\s*Key Takeaways\s*\n(.*?)(?=\n##\s|\Z)",
+                                full, _re.S)
+                if m1: text += m1.group(1).strip()[:15_000]
+                if m2: text += "\n\n" + m2.group(1).strip()[:15_000]
+                kind = "analysis-body"
+                if not text.strip():
+                    print(f"  skip {slug}: empty analysis body", file=sys.stderr)
+                    continue
+            else:
+                tpath = args.out / f"{slug}.transcript.txt"
+                if not tpath.exists():
+                    print(f"  skip {slug}: no transcript sidecar", file=sys.stderr)
+                    continue
+                text = tpath.read_text(encoding="utf-8")
+            # ponytail: avoid burning a Gemini call when tags already exist
+            # AND we're in --reclassify-from-md (idempotent on already-tagged).
+            existing = _get_tags(index_conn, slug)
+            if existing and not force:
+                print(f"  skip {slug}: already tagged {existing}", file=sys.stderr)
                 continue
-            text = tpath.read_text(encoding="utf-8")
-            tags = classify_transcript(api_key, text, _VOCAB)
+            tags = classify_text(api_key, text, _VOCAB, kind=kind)
             _set_tags(index_conn, slug, tags)
             _write_tags_to_frontmatter(p, tags)
-            print(f"  {slug}: {','.join(tags) if tags else '(no tags)'}", file=sys.stderr)
+            print(f"  {slug}: {','.join(tags) if tags else '(no tags)'} "
+                  f"[from {kind}]", file=sys.stderr)
         index_conn.close()
         return 0
+
+    # ponytail: --retry-skips iterates the index, finds every row whose outcome
+    # starts with 'skip', re-runs process_one(). A skip row's *file* is the
+    # absent <slug>.md; analyze.py's dedup returns 0 only when the *file* exists
+    # so a re-run is a real "did captions appear?" probe, not a no-op.
+    if getattr(args, "retry_skips", False):
+        from urllib.parse import urlparse
+        skip_slugs = [r[0] for r in index_conn.execute(
+            "SELECT slug FROM analyzed_videos WHERE outcome LIKE 'skip%' "
+            "ORDER BY slug"
+        )]
+        print(f"# retry-skips: {len(skip_slugs)} slug(s)", file=sys.stderr)
+        recovered = 0
+        for slug in skip_slugs:
+            # ponytail: pull the URL back out of the index so the user doesn't
+            # have to remember which skip came from which takeout.
+            row = index_conn.execute(
+                "SELECT url FROM analyzed_videos WHERE slug = ?", (slug,)
+            ).fetchone()
+            if not row:
+                continue
+            url = row[0]
+            print(f"  retry {slug}  ({url})", file=sys.stderr)
+            r = process_one(api_key, slug, "", args.out, mode, index_conn)
+            if r == 0:
+                recovered += 1
+        print(f"# retry-skips: {recovered}/{len(skip_slugs)} recovered",
+              file=sys.stderr)
+        index_conn.close()
+        return 0 if recovered else 1
 
     skipped = 0
     try:

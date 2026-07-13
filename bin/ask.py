@@ -18,29 +18,25 @@ a sidecar are skipped with a stderr warning.
 
 from __future__ import annotations
 import argparse
-import json
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
+from _gemini import gemini_key as _gemini_key, post_text as _post_text
+
+# ponytail: keep public name `gemini_key` for any external callers; bind the
+# helper to the local name without duplicating it.
+gemini_key = _gemini_key
 
 GEMINI_MODEL = "gemini-3.1-flash-lite"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
 DEFAULT_TRANSCRIPT_DIR = Path.home() / "Documents" / "video-analysis"
 # ponytail: 60 KB is the safe ceiling; transcripts above this get truncated
 # (analyze.py uses the same threshold for Gemini text calls).
 TRANSCRIPT_BUDGET = 60_000
 
 
-def gemini_key() -> str:
-    env = Path.home() / "AppData" / "Local" / "hermes" / ".env"
-    for line in env.read_text(encoding="utf-8").splitlines():
-        if line.startswith("GEMINI_API_KEY="):
-            return line.split("=", 1)[1]
-    raise SystemExit("GEMINI_API_KEY missing from ~/.hermes/.env")
+# ponytail: gemini_key shim — back-compat for callers importing this module.
+# Real implementation lives in _gemini.py.
+def gemini_key_local():
+    return _gemini_key()
 
 
 def slug_from_url(u: str) -> str:
@@ -90,24 +86,8 @@ def build_prompt(question: str, transcripts: list[str], slugs: list[str]) -> str
 
 def ask(question: str, transcripts: list[str], slugs: list[str],
        api_key: str) -> str:
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": build_prompt(question, transcripts, slugs)}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 4096},
-    }
-    req = urllib.request.Request(
-        f"{GEMINI_URL}?key={api_key}",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = json.loads(r.read())
-            parts = data["candidates"][0]["content"].get("parts") or []
-            return "".join(p.get("text", "") for p in parts) or "(empty response)"
-    except urllib.error.HTTPError as e:
-        return f"ERROR {e.code}: {e.read().decode()[:300]}"
-    except Exception as e:
-        return f"ERROR {type(e).__name__}: {e}"
+    return _post_text(build_prompt(question, transcripts, slugs), api_key,
+                      GEMINI_MODEL)
 
 
 def main() -> int:

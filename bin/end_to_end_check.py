@@ -180,6 +180,44 @@ conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_tag,))
 conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_tag,))
 conn.commit(); conn.close()
 
+# 7c. _gemini.py shared helper — module imports + key parses + surfaces.
+sys.path.insert(0, str(BIN))
+try:
+    import _gemini
+    ok = (hasattr(_gemini, "post_text")
+          and hasattr(_gemini, "post")
+          and hasattr(_gemini, "gemini_key")
+          and "GEMINI_API_KEY=" in Path(_gemini.ENV_PATH).read_text(encoding="utf-8"))
+    check("_gemini.py: shared POST helper surface", ok,
+          f"has: post_text={hasattr(_gemini, 'post_text')} "
+          f"post={hasattr(_gemini, 'post')}")
+except Exception as e:
+    check("_gemini.py: imports", False, f"{type(e).__name__}: {e}")
+
+# 7d. analyze.py --reclassify-from-md is exposed (idempotency: skip-if-tagged
+# prevents burning free-tier quota in CI).
+rc = run([sys.executable, str(BIN / "analyze.py"), "--help"], timeout=30)
+ok = "--reclassify-from-md" in rc.stdout and "--retry-skips" in rc.stdout
+check("analyze.py: --reclassify-from-md + --retry-skips exposed", ok,
+      f"rc={rc.returncode}")
+
+# 7e. verify at least one multimodal-mode file is now tagged (D14 effect).
+n_tagged_multimodal = sqlite3.connect(str(IDX)).execute(
+    "SELECT COUNT(*) FROM analyzed_videos v JOIN tag_assignments t "
+    "ON v.slug=t.slug WHERE v.mode='multimodal'"
+).fetchone()[0]
+check("corpus: ≥1 multimodal-mode file tagged", n_tagged_multimodal >= 1,
+      f"count={n_tagged_multimodal}")
+
+# 7f. takeout_sample.py back-compat shim — still routes to url_source.py.
+rc = run([sys.executable, str(BIN / "takeout_sample.py"),
+          "--source", "takeout-watch", "--n", "1"], timeout=30)
+ok = (rc.returncode == 0
+      and "source: takeout-watch" in rc.stderr
+      and "| https://www.youtube.com/watch?v=" in rc.stdout)
+check("takeout_sample.py: back-compat shim works", ok,
+      f"rc={rc.returncode}")
+
 # 8. list.py: corpus inventory. (D12.)
 rc = run([sys.executable, str(BIN / "list.py")], timeout=30)
 ok = (rc.returncode == 0 and "M1E4ZzdpOco" in rc.stdout
