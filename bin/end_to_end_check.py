@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 USERPROFILE = Path(os.environ["USERPROFILE"])
@@ -362,6 +363,67 @@ ok = (rc.returncode == 0
       and "ok" not in rc.stdout.split("# ok")[-1] if "# ok" in rc.stdout else True)
 check("list.py --outcome: filters", ok,
       f"rc={rc.returncode}")
+
+# 9. Jobs queue (rung 1): init, enqueue, list, show, idempotent re-enqueue,
+#    and the audit-log atomic state transition that the dispatcher relies on.
+sys.path.insert(0, str(BIN))
+try:
+    import jobs as _jobs
+
+    # fresh DB so the probe is reproducible
+    _jobs.JOBS_DB = Path(tempfile.gettempdir()) / "jobs_e2e.sqlite"
+    if _jobs.JOBS_DB.exists():
+        _jobs.JOBS_DB.unlink()
+    _jobs.init()
+
+    _jid = _jobs.enqueue("analyze", {"url": "https://www.youtube.com/watch?v=E2E_PROBE"})
+    check("jobs: enqueue returns int on first call",
+          isinstance(_jid, int) and _jid > 0, f"id={_jid}")
+    _jid2 = _jobs.enqueue("analyze", {"url": "https://www.youtube.com/watch?v=E2E_PROBE"})
+    check("jobs: enqueue is idempotent on key_hash (returns None)",
+          _jid2 is None, f"second_id={_jid2}")
+
+    _rows = _jobs.list_jobs(state="pending", limit=10)
+    check("jobs: list reflects the enqueued row",
+          any(r["id"] == _jid for r in _rows), f"n={len(_rows)}")
+
+    # Audit-log atomic state transition.
+    c = _jobs._conn()
+    _jobs._set_state(c, _jid, "running", "e2e test")
+    _jobs._set_state(c, _jid, "ok", "e2e test")
+    c.commit(); c.close()
+    _job, _log = _jobs.show_job(_jid)
+    states = [e["to_state"] for e in _log]
+    check("jobs: audit log records pending -> running -> ok",
+          _job["state"] == "ok" and "running" in states and "ok" in states,
+          f"states={states}")
+
+    # Cleanup the temp DB.
+    if _jobs.JOBS_DB.exists():
+        _jobs.JOBS_DB.unlink()
+except Exception as e:
+    check("jobs: probe ran cleanly", False, f"{type(e).__name__}: {e}")
+
+# 10. daemon.py + kanban.py — scheduler hook surfaces.
+try:
+    import daemon as _daemon
+    interval = _daemon._parse_interval("20m")
+    check("daemon: --interval 20m parses to 1200s", interval == 1200.0,
+          f"got {interval}")
+except Exception as e:
+    check("daemon: _parse_interval smoke", False, f"{type(e).__name__}: {e}")
+
+rc = run([sys.executable, str(BIN / "daemon.py"), "--help"], timeout=15)
+ok = "interval" in rc.stdout and "limit" in rc.stdout
+check("daemon.py --help surfaces --interval + --limit", ok, f"rc={rc.returncode}")
+
+rc = run([sys.executable, str(BIN / "kanban.py"), "--help"], timeout=15)
+ok = "--state" in rc.stdout and "--watch" in rc.stdout
+check("kanban.py --help surfaces --state + --watch", ok, f"rc={rc.returncode}")
+
+rc = run([sys.executable, str(BIN / "kanban.py"), "--state", "ok"], timeout=10)
+ok = rc.returncode == 0 and ("ok (" in rc.stdout or "no rows" in rc.stdout)
+check("kanban.py --state ok renders without error", ok, f"rc={rc.returncode}")
 
 # Summary.
 print()
