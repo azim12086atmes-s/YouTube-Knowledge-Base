@@ -740,19 +740,24 @@ def main() -> int:
             if result == 1:
                 skipped += 1
                 continue
-            # ponytail: --classify adds one cheap Gemini call (~1s, 64 output tokens)
-            # per successful analyze. Skipped silently on classification failure.
+            # ponytail: --classify adds one cheap Gemini call (~1s, 64 output
+            # tokens) per successful analyze. Works on transcript AND
+            # multimodal-mode files — body_text_for_classify() picks the
+            # best-available text. Skipped silently on classification failure
+            # or when the slug has no usable text.
             if getattr(args, "classify", False):
-                tpath = args.out / f"{slug}.transcript.txt"
-                if tpath.exists():
-                    from vector_store import set_tags as _set_tags, TAG_VOCAB as _VOCAB
-                    tags = classify_transcript(api_key,
-                                               tpath.read_text(encoding="utf-8"),
-                                               _VOCAB)
-                    _set_tags(index_conn, slug, tags)
-                    _write_tags_to_frontmatter(tpath.with_suffix(".md"), tags)
-                    print(f"  classify: {','.join(tags) if tags else '(no tags)'}",
+                from vector_store import (set_tags as _set_tags, TAG_VOCAB as _VOCAB,
+                                         body_text_for_classify as _btc)
+                text, kind = _btc(slug, args.out)
+                if not kind:
+                    print(f"  classify: skipped {slug} (no transcript or body)",
                           file=sys.stderr)
+                    continue
+                tags = classify_text(api_key, text, _VOCAB, kind=kind)
+                _set_tags(index_conn, slug, tags)
+                _write_tags_to_frontmatter(args.out / f"{slug}.md", tags)
+                print(f"  classify: {','.join(tags) if tags else '(no tags)'} "
+                      f"[from {kind}]", file=sys.stderr)
     finally:
         index_conn.close()
 

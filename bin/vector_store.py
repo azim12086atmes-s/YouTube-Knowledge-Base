@@ -127,10 +127,9 @@ def upsert_chunks(conn: sqlite3.Connection, slug: str,
     conn.commit()
     return inserted
 
-
-# ponytail: lift the "which text do we embed?" decision into one helper.
-# Multimodal-mode analyses have no transcript sidecar; the search corpus
-# shouldn't be missing 5 of 8 files because they had no captions to fetch.
+# ponytail: lift the "which text do we embed?/classify?" decision into one
+# helper. Multimodal-mode analyses have no transcript sidecar; both the
+# vector index and the tagger need a fallback that reads the markdown body.
 def body_text_for_indexing(md_path) -> str:
     """Return the best-available text for vector indexing.
 
@@ -155,6 +154,22 @@ def body_text_for_indexing(md_path) -> str:
                     text, _re.S)
     if m2: parts.append(m2.group(1).strip())
     return "\n\n".join(parts)
+
+
+def body_text_for_classify(slug: str, corpus_dir) -> tuple[str, str]:
+    """Pair up a slug with the best text + its kind for the tagger.
+
+    Returns (text, kind) where kind ∈ {"transcript", "analysis-body", ""}.
+    "" means no usable text; the caller skips the call."""
+    import re as _re
+    from pathlib import Path as _P
+    base = _P(corpus_dir)
+    tpath = base / f"{slug}.transcript.txt"
+    if tpath.exists():
+        return tpath.read_text(encoding="utf-8", errors="replace"), "transcript"
+    md = base / f"{slug}.md"
+    text = body_text_for_indexing(md)
+    return (text, "analysis-body" if text else "")
 
 
 def search(conn: sqlite3.Connection, query: str, k: int = 10) -> list[dict]:
