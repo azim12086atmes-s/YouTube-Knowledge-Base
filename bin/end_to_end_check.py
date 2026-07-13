@@ -252,6 +252,24 @@ ok = bool(_pkgs) and all(_md.version(n) == v for n, v in _pkgs)
 check("D21: requirements.txt pins match dev venv", ok,
       f"{[(n, _md.version(n), v) for n, v in _pkgs]}")
 
+# 7k. Docs round-trip: ARCHITECTURE.md exists and references the 5
+# NotebookLM features we DO transfer. Probe phrases chosen so that
+# minor rewording of the doc doesn't false-fail.
+_arch = (Path(__file__).resolve().parent.parent / "docs" / "ARCHITECTURE.md")
+_arch_text = _arch.read_text(encoding="utf-8").lower() if _arch.exists() else ""
+# ponytail: a list of phrase fragments; ≥4 of 5 must be present.
+_nbm_phrases = [
+    "transcript",            # transcript-only ingestion
+    "source select",          # source selection per query
+    "evidence",               # evidence-span IDs / quote-by-source
+    "inline citation",        # inline citations
+    "refusal",                # honest refusal on no-evidence
+]
+_hits = [p for p in _nbm_phrases if p in _arch_text]
+ok = bool(_arch.exists()) and len(_hits) >= 4
+check("D24: docs/ARCHITECTURE.md names the NotebookLM features we transfer",
+      ok, f"present={_hits}")
+
 # 7j. Web UI: routes present + healthz + index.html + a non-LLM endpoint.
 # ponytail: TestClient from FastAPI is the official "no live port" probe.
 # Skip the live-LLM /api/query probe to avoid burning free-tier quota in CI.
