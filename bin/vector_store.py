@@ -152,13 +152,79 @@ def search(conn: sqlite3.Connection, query: str, k: int = 10) -> list[dict]:
     return out
 
 
+# ponytail: chat persistence lives in the same SQLite file. No new module.
+# Schema: chat_messages(session_id, role, content, ts). role ∈ {user, model}.
+CHAT_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT    NOT NULL,
+        role       TEXT    NOT NULL,
+        content    TEXT    NOT NULL,
+        ts         REAL    NOT NULL
+    )
+"""
+
+
+def init_chat(conn: sqlite3.Connection) -> None:
+    conn.execute(CHAT_TABLE_SQL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS chat_messages_session "
+        "ON chat_messages(session_id, id)"
+    )
+    conn.commit()
+
+
+def save_message(conn: sqlite3.Connection, session_id: str,
+                 role: str, content: str) -> None:
+    import time as _t
+    init_chat(conn)
+    conn.execute(
+        "INSERT INTO chat_messages(session_id, role, content, ts) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, role, content, _t.time()),
+    )
+    conn.commit()
+
+
+def load_messages(conn: sqlite3.Connection, session_id: str,
+                  limit: int = 8) -> list[dict]:
+    """Return the most recent `limit` messages for a session, oldest first."""
+    init_chat(conn)
+    rows = conn.execute(
+        "SELECT role, content, ts FROM chat_messages "
+        "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+        (session_id, limit),
+    ).fetchall()
+    return [{"role": r[0], "content": r[1], "ts": r[2]} for r in reversed(rows)]
+
+
+def clear_session(conn: sqlite3.Connection, session_id: str) -> int:
+    init_chat(conn)
+    cur = conn.execute(
+        "DELETE FROM chat_messages WHERE session_id = ?", (session_id,)
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def list_sessions(conn: sqlite3.Connection) -> list[dict]:
+    init_chat(conn)
+    rows = conn.execute(
+        "SELECT session_id, COUNT(*), MIN(ts), MAX(ts) "
+        "FROM chat_messages GROUP BY session_id ORDER BY MAX(ts) DESC"
+    ).fetchall()
+    return [{"session_id": r[0], "count": r[1], "first_ts": r[2], "last_ts": r[3]}
+            for r in rows]
+
+
+# ponytail: self-check extension. Verifies init + save + load + clear roundtrip.
 if __name__ == "__main__":
-    # ponytail: one self-check. Probes load+insert+search roundtrip.
     import tempfile, os, sys
     tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
     tmp.close()
     conn = sqlite3.connect(tmp.name)
 
+    # --- existing test ---
     sample = ("This is a test transcript about vector stores. " * 50 +
               "It talks about cosine similarity and sqlite-vec. " * 30)
     n = upsert_chunks(conn, "testslug", sample)
@@ -168,11 +234,25 @@ if __name__ == "__main__":
     for h in hits:
         print(f"  hit slug={h['slug']} idx={h['idx']} dist={h['distance']:.3f} "
               f"text={h['text'][:80]!r}")
-
     assert hits, "expected at least one hit"
     assert any("cosine" in h["text"] for h in hits), \
         "expected cosine chunk in top-k"
     print("OK  vector_store self-check passed")
+
+    # --- chat-store test ---
+    init_chat(conn)
+    save_message(conn, "s1", "user", "hi")
+    save_message(conn, "s1", "model", "hello")
+    save_message(conn, "s1", "user", "what's up")
+    msgs = load_messages(conn, "s1")
+    assert len(msgs) == 3, f"expected 3 msgs, got {len(msgs)}"
+    assert msgs[0]["role"] == "user" and msgs[2]["content"] == "what's up", \
+        f"order/content wrong: {msgs}"
+    cleared = clear_session(conn, "s1")
+    assert cleared == 3, f"expected 3 cleared, got {cleared}"
+    msgs = load_messages(conn, "s1")
+    assert msgs == [], f"expected empty after clear, got {msgs}"
+    print("OK  chat_store self-check passed")
 
     conn.close()
     os.unlink(tmp.name)

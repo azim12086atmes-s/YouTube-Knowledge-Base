@@ -17,8 +17,8 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 * Not a hosted service. Runs entirely on your machine.
 * Not a video downloader / scraper. Reads what already exists in a Takeout
   zip.
-* Not a multi-turn chat UI. `ask.py` is one-shot Q&A over the corpus;
-  there's no conversation memory or chat-style interface.
+* Not a web UI. `chat.py` is a CLI REPL. A browser-based chat is a future
+  rung gated on user request.
 
 ## What it does today
 
@@ -32,7 +32,7 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Ask a question across the entire corpus | ✓ (`ask.py --all`) |
 | Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
-| Chat interface (multi-turn, conversation memory, UI) | ✗ — gated on a real question that needs back-and-forth; today `ask.py --question "..."` is single-shot |
+| Chat interface (multi-turn, conversation memory, UI) | ✓ — `bin/chat.py` REPL. Per-session history persisted in `chat_messages` table; retrieval + history injection per turn. CLI today; UI is a future rung gated on user request. |
 | Query raw transcript chunks verbatim | ✓ — `ask.py --show-chunks` prints top-k retrieved excerpts with slug + cosine distance before the LLM answer |
 | Vector store / semantic search | ✓ — `sqlite-vec` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim). `ask.py --all` uses cosine top-k; explicit-URL mode falls back to bundle-and-ask when the index has no embeddings. |
 | Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
@@ -105,6 +105,29 @@ python bin/ask.py --all --question "what themes run across my watched videos?"
 Honest refusal is built in — if no transcript addresses your question, the
 model will say so rather than confabulate.
 
+### Multi-turn chat (CLI REPL)
+
+```bash
+python bin/chat.py                      # default session
+python bin/chat.py --session mychat    # named session
+```
+
+Each turn: vector-search the corpus, prepend top-k excerpts to the
+prompt, then call Gemini with the last 8 messages of conversation
+history (4 user+model pairs). History is persisted in the same SQLite
+file. Commands:
+
+| command | what |
+|---|---|
+| `:quit` | exit (Ctrl-D / Ctrl-Z also works) |
+| `:clear` | wipe session history |
+| `:status` | session id + message count + last retrieval summary |
+| `:show` | print last retrieved chunks (same as `ask.py --show-chunks`) |
+| `:history` | dump raw conversation history |
+| `:sessions` | list all sessions in the DB |
+
+CLI today. A web UI is a future rung, gated on user request.
+
 To see the *raw* retrieved transcript excerpts (slug + cosine distance +
 verbatim text) before the LLM answer:
 
@@ -134,8 +157,10 @@ video-pipeline/
 ├── bin/
 │   ├── analyze.py       # 1-URL → 4-shape Markdown + SQLite row
 │   ├── ask.py           # RAG over chosen/all transcripts (bundle-and-ask)
+│   ├── chat.py          # multi-turn REPL with history persistence
 │   ├── pipeline.py      # Takeout → sample → analyze; supports --resume
 │   ├── url_source.py    # URL sources (takeout-watch, takeout-watch-all)
+│   ├── vector_store.py  # chunk + embed + cosine search + chat persistence
 │   └── takeout_sample.py# Compatibility alias of url_source.py
 ├── corpus -> ~/Documents/video-analysis   # symlink: outputs land here
 │   ├── <slug>.md                            # 4-shape analysis per video
