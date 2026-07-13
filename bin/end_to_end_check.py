@@ -116,6 +116,26 @@ ok = rc.returncode == 0 and "# retrieved chunks:" in rc.stdout \
 check("ask.py --show-chunks: emits chunks block",
       ok, f"rc={rc.returncode}")
 
+# 5b. ask.py --tag filter (D3).
+rc = run([sys.executable, str(BIN / "ask.py"), "--all",
+          "--tag", "ai-tooling",
+          "--question", "What does this speaker say about building software?"],
+         timeout=120)
+ok = (rc.returncode == 0
+      and "--tag {ai-tooling} matched" in (rc.stderr or "")
+      and "M1E4ZzdpOco" in (rc.stdout or ""))
+check("ask.py --tag: filters to matching slugs",
+      ok, f"rc={rc.returncode} out_len={len(rc.stdout)}")
+
+# 5c. ask.py --tag with no matches → empty + clean error.
+rc = run([sys.executable, str(BIN / "ask.py"), "--all",
+          "--tag", "religion-or-faith",
+          "--question", "anything"], timeout=60)
+ok = (rc.returncode != 0  # exits non-zero on empty result
+      and "no transcripts found" in (rc.stderr or ""))
+check("ask.py --tag with no matches: clean error",
+      ok, f"rc={rc.returncode}")
+
 # 6. chat.py REPL: single-turn via stdin.
 import time
 session = f"e2e_check_{int(time.time())}"

@@ -121,6 +121,9 @@ def main() -> int:
     p.add_argument("--show-chunks", action="store_true",
                    help="print the top-k retrieved chunks (raw transcript excerpts) "
                         "before the LLM answer; useful for verifying retrieval quality")
+    p.add_argument("--tag", action="append", default=[],
+                   help="filter --all to chunks whose source slug has this tag "
+                        "(repeatable for union: --tag a --tag b = either a or b)")
     p.add_argument("--transcripts-dir", type=Path, default=DEFAULT_TRANSCRIPT_DIR,
                    help=f"directory holding <slug>.transcript.txt sidecars "
                         f"(default: {DEFAULT_TRANSCRIPT_DIR})")
@@ -132,7 +135,9 @@ def main() -> int:
         slugs = []
         transcripts = []
         for p in sorted(args.transcripts_dir.glob("*.transcript.txt")):
-            slug = p.stem
+            # ponytail: p.stem only strips the last suffix. The full name is
+            # `<slug>.transcript.txt`, so strip both suffixes.
+            slug = p.name.removesuffix(".transcript.txt")
             slugs.append(slug)
             transcripts.append(p.read_text(encoding="utf-8"))
         print(f"# --all: {len(transcripts)} transcripts in {args.transcripts_dir}",
@@ -146,6 +151,44 @@ def main() -> int:
         for m in missing:
             print(f"warn: no .transcript.txt for {m} (analyze.py transcript-mode "
                   f"creates one; multimodal-only analyses don't)", file=sys.stderr)
+
+    # ponytail: --tag filter. With --all, union the slug-sets matching
+    # any tag and intersect with the loaded corpus. With explicit URLs,
+    # check each slug's tags and skip ones that don't match.
+    if args.tag:
+        from pathlib import Path as _P
+        idx_path = _P(args.transcripts_dir) / "analyzed.sqlite"
+        if not idx_path.exists():
+            print(f"# --tag ignored: no index at {idx_path}", file=sys.stderr)
+        else:
+            try:
+                import sqlite3 as _sql
+                conn = _sql.connect(str(idx_path))
+                from vector_store import get_slugs_by_tag as _get_slugs_by_tag
+                allowed: set[str] = set()
+                for t in args.tag:
+                    allowed |= _get_slugs_by_tag(conn, t)
+                if not args.all:
+                    allowed &= set(slugs)
+                paired = [(s, t) for s, t in zip(slugs, transcripts) if s in allowed]
+                if paired:
+                    slugs = [p[0] for p in paired]
+                    transcripts = [p[1] for p in paired]
+                    print(f"# --tag {{{','.join(args.tag)}}} matched {len(slugs)} "
+                          f"slug(s)", file=sys.stderr)
+                else:
+                    slugs = []
+                    transcripts = []
+                    print(f"# --tag {{{','.join(args.tag)}}} matched 0 slugs; "
+                          f"falling through to empty result", file=sys.stderr)
+            except Exception as e:
+                print(f"# --tag ignored ({type(e).__name__}: {e})",
+                      file=sys.stderr)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     if not transcripts:
         print("error: no transcripts found", file=sys.stderr); return 1

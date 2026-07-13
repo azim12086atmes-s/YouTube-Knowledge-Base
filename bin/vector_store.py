@@ -164,6 +164,31 @@ CHAT_TABLE_SQL = """
     )
 """
 
+# ponytail: tag assignments for classification filtering.
+# One row per (slug, tag). Multiple tags per slug allowed.
+TAG_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS tag_assignments (
+        slug TEXT    NOT NULL,
+        tag  TEXT    NOT NULL,
+        ts   REAL    NOT NULL,
+        PRIMARY KEY (slug, tag)
+    )
+"""
+
+# ponytail: fixed vocabulary for D3 classification. Add new tags as needed;
+# the classifier prompt is told to pick from this set or emit "other".
+TAG_VOCAB = (
+    "ai-tooling",
+    "founder-psychology",
+    "investing",
+    "personal-development",
+    "religion-or-faith",
+    "history-or-politics",
+    "music-or-performance",
+    "lifestyle-or-cooking",
+    "other",
+)
+
 
 def init_chat(conn: sqlite3.Connection) -> None:
     conn.execute(CHAT_TABLE_SQL)
@@ -217,6 +242,53 @@ def list_sessions(conn: sqlite3.Connection) -> list[dict]:
             for r in rows]
 
 
+# ponytail: tag CRUD. Keeps vocabulary concerns in one place. No new module.
+
+def init_tags(conn: sqlite3.Connection) -> None:
+    conn.execute(TAG_TABLE_SQL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS tag_assignments_tag "
+        "ON tag_assignments(tag)"
+    )
+    conn.commit()
+
+
+def set_tags(conn: sqlite3.Connection, slug: str, tags: list[str]) -> None:
+    """Replace the tag set for a slug. Idempotent."""
+    import time as _t
+    init_tags(conn)
+    conn.execute("DELETE FROM tag_assignments WHERE slug = ?", (slug,))
+    now = _t.time()
+    seen = set()
+    for t in tags:
+        t = (t or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        conn.execute(
+            "INSERT INTO tag_assignments(slug, tag, ts) VALUES (?, ?, ?)",
+            (slug, t, now),
+        )
+    conn.commit()
+
+
+def get_tags(conn: sqlite3.Connection, slug: str) -> list[str]:
+    init_tags(conn)
+    rows = conn.execute(
+        "SELECT tag FROM tag_assignments WHERE slug = ? ORDER BY tag",
+        (slug,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_slugs_by_tag(conn: sqlite3.Connection, tag: str) -> set[str]:
+    """Used by ask.py --tag filter."""
+    init_tags(conn)
+    rows = conn.execute(
+        "SELECT slug FROM tag_assignments WHERE tag = ?", (tag,)
+    ).fetchall()
+    return {r[0] for r in rows}
+
 # ponytail: self-check extension. Verifies init + save + load + clear roundtrip.
 if __name__ == "__main__":
     import tempfile, os, sys
@@ -253,6 +325,20 @@ if __name__ == "__main__":
     msgs = load_messages(conn, "s1")
     assert msgs == [], f"expected empty after clear, got {msgs}"
     print("OK  chat_store self-check passed")
+
+    # --- tag-store test ---
+    init_tags(conn)
+    set_tags(conn, "vid1", ["ai-tooling", "founder-psychology"])
+    set_tags(conn, "vid2", ["ai-tooling"])
+    set_tags(conn, "vid3", ["other"])
+    set_tags(conn, "vid1", ["ai-tooling", "investing"])  # replace, not append
+    assert get_tags(conn, "vid1") == ["ai-tooling", "investing"], \
+        f"set_tags should replace: got {get_tags(conn, 'vid1')}"
+    assert get_slugs_by_tag(conn, "ai-tooling") == {"vid1", "vid2"}, \
+        f"expected {{vid1, vid2}}, got {get_slugs_by_tag(conn, 'ai-tooling')}"
+    assert get_slugs_by_tag(conn, "investing") == {"vid1"}, \
+        f"expected {{vid1}}, got {get_slugs_by_tag(conn, 'investing')}"
+    print("OK  tag_store self-check passed")
 
     conn.close()
     os.unlink(tmp.name)

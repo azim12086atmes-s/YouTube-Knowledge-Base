@@ -34,6 +34,8 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
 | Chat interface (multi-turn, conversation memory, UI) | ✓ — `bin/chat.py` REPL. Per-session history persisted in `chat_messages` table; retrieval + history injection per turn. CLI today; UI is a future rung gated on user request. |
 | Query raw transcript chunks verbatim | ✓ — `ask.py --show-chunks` prints top-k retrieved excerpts with slug + cosine distance before the LLM answer |
+| Classification (auto-tag into fixed vocab) | ✓ — `analyze.py --classify` / `--reclassify`. 9-tag vocabulary (ai-tooling, founder-psychology, investing, personal-development, religion-or-faith, history-or-politics, music-or-performance, lifestyle-or-cooking, other). |
+| Set-logic recall (union/intersection across tags) | ✓ — `ask.py --tag <t>` (repeatable: `--tag a --tag b` = either); tag CRUD in `tag_assignments` table. |
 | Vector store / semantic search | ✓ — `sqlite-vec` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim). `ask.py --all` uses cosine top-k; explicit-URL mode falls back to bundle-and-ask when the index has no embeddings. |
 | Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
 | Push trigger from YouTube webhooks | ✗ — gated on a real external process |
@@ -165,6 +167,31 @@ Useful when the LLM-rendered answer loses detail that the raw chunk
 preserves, or when you want to quote a video directly without going
 through the model.
 
+### Classify + filter by tag
+
+Each analyzed video gets classified into one of nine fixed tags:
+`ai-tooling`, `founder-psychology`, `investing`, `personal-development`,
+`religion-or-faith`, `history-or-politics`, `music-or-performance`,
+`lifestyle-or-cooking`, `other`. Tags are persisted in a SQLite table
+and written back to the front-matter of the analysis file.
+
+```bash
+# Tag as part of a fresh analyze:
+python bin/analyze.py "https://youtu.be/<id>" --classify
+
+# Re-tag every existing markdown in the corpus (one Gemini call each):
+python bin/analyze.py --reclassify
+
+# Ask a question, restricting to a single tag:
+python bin/ask.py --all --tag ai-tooling --question "what does the speaker say about building software?"
+
+# Ask across multiple tags (union — either tag matches):
+python bin/ask.py --all --tag investing --tag founder-psychology --question "what themes repeat?"
+```
+
+`--tag` requires the SQLite index to exist; `analyze.py --reindex-from-md`
+populates it.
+
 ### What channels do I watch most?
 
 ```bash
@@ -227,6 +254,9 @@ Read `REQUIREMENTS.md` first if you want to know what's *not* built and why.
   `ask.py --all` uses cosine top-k, `bin/chat.py` uses it per turn.
 - Multi-turn chat works: `bin/chat.py` REPL with persisted history
   (8-message cap per turn).
+- Classification works: `analyze.py --classify` tags each analyzed video
+  from a fixed 9-tag vocabulary; `analyze.py --reclassify` re-tags existing
+  files. `ask.py --tag <t>` filters retrieval to slugs matching `<t>`.
 
 ## Recent changes
 
@@ -234,6 +264,8 @@ The full history lives in `git log`. Most recent commits (newest first):
 
 | commit | what |
 |---|---|
+| *(this turn)* | D3 + D4: classification (`analyze.py --classify` / `--reclassify`) + tag-filter (`ask.py --tag`); fixed `p.stem` bug in `--all` slug extraction |
+| `ce42fcb` | End-to-end check script (`bin/end_to_end_check.py`) + README verify section |
 | `8a595f8` | Multi-turn chat REPL (`bin/chat.py`) + chat-store functions in `bin/vector_store.py` |
 | `2cb4de5` | README refresh: vector-store / show-chunks / chat rows |
 | `92fde63` | `--show-chunks` flag in `ask.py` — print raw retrieved transcript excerpts |

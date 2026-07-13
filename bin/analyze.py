@@ -249,6 +249,44 @@ def call_gemini_text(api_key: str, prompt: str, transcript: str,
     return result  # last error
 
 
+# ponytail: classify a transcript into the fixed vocabulary.
+# Cheap (one short Gemini call, 32 max output tokens, ~1s wall).
+# Returns a list of tag strings (deduped, stripped).
+def classify_transcript(api_key: str, transcript: str,
+                        vocab: tuple[str, ...]) -> list[str]:
+    vocab_str = ", ".join(f"\"{t}\"" for t in vocab)
+    prompt = (
+        f"You classify YouTube transcripts. The transcript is below.\n\n"
+        f"Pick 1-3 tags from this fixed vocabulary that describe the topic(s):\n"
+        f"{vocab_str}\n\n"
+        f"Output ONLY a JSON array of strings. Nothing else. Example: [\"ai-tooling\"]\n\n"
+        f"Transcript:\n```\n{transcript[:20_000]}\n```"
+    )
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 64},
+    }
+    result = _post(GEMINI_TEXT_MODEL, api_key, body, timeout=60)
+    if result.startswith("ERROR"):
+        return []
+    # ponytail: extract the JSON array. Tolerate ```json fences.
+    import re
+    m = re.search(r"\[([^\[\]]*)\]", result)
+    if not m:
+        return []
+    raw = m.group(1)
+    parts = [p.strip().strip('"').strip("'") for p in raw.split(",")]
+    valid = set(vocab)
+    seen = set()
+    out = []
+    for p in parts:
+        if not p or p in seen or p not in valid:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 
 def fetch_transcript(video_url: str) -> Optional[str]:
     """Call the youtube-content skill helper. Returns text on success, None on failure.
@@ -317,6 +355,34 @@ def slug_from_url(url_or_id: str) -> str:
 def full_url(url_or_id: str) -> str:
     slug = slug_from_url(url_or_id)
     return f"https://www.youtube.com/watch?v={slug}"
+
+
+def _write_tags_to_frontmatter(md_path: Path, tags: list[str]) -> None:
+    """Replace the `tags:` line in the front-matter with the new tag list.
+    Idempotent. Creates the file with a stub front-matter if missing."""
+    if not md_path.exists():
+        return
+    import re as _re
+    text = md_path.read_text(encoding="utf-8")
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end > 0:
+            head, rest = text[:end + 4], text[end + 4:]
+        else:
+            head, rest = text, ""
+    else:
+        head, rest = "", "\n" + text
+    rendered = "[" + ", ".join(tags) + "]" if tags else "[]"
+    if _re.search(r"^tags:\s*\[", head, _re.M):
+        head = _re.sub(r"^tags:\s*\[.*?\]", f"tags: {rendered}", head,
+                       count=1, flags=_re.M)
+    else:
+        head = head.rstrip()
+        if head.endswith("---"):
+            head = head[:-3].rstrip() + f"\ntags: {rendered}\n---"
+        else:
+            head = head + f"\ntags: {rendered}"
+    md_path.write_text(head + rest, encoding="utf-8")
 
 
 def write_markdown(out_path: Path, slug: str, url: str, watched_at: str,
@@ -472,6 +538,12 @@ def main() -> int:
     p.add_argument("--reindex-from-md", action="store_true",
                    help="backfill the SQLite index from existing markdown files in --out; "
                         "one-time data-quality fix when the index is sparse")
+    p.add_argument("--classify", action="store_true",
+                   help="after the 4-shape analysis, run a small Gemini call to "
+                        "classify the transcript into TAG_VOCAB; writes tags to front-matter + tag_assignments table")
+    p.add_argument("--reclassify", action="store_true",
+                   help="iterate every markdown file in --out and (re-)classify it "
+                        "without re-running the 4-shape analysis; updates front-matter + tag_assignments")
     args = p.parse_args()
 
     mode = "transcript" if args.transcript else "multimodal"
@@ -540,6 +612,31 @@ def main() -> int:
               file=sys.stderr)
         return 0
 
+    # ponytail: --reclassify iterates every markdown file in --out that has
+    # a transcript sidecar, classifies via Gemini, and writes tags back to
+    # front-matter + tag_assignments. No re-running of the 4-shape analysis.
+    if getattr(args, "reclassify", False):
+        from vector_store import set_tags as _set_tags
+        import re as _re
+        slug_re = _re.compile(r"^([A-Za-z0-9_-]{11})\.md$")
+        files = sorted(p for p in args.out.glob("*.md")
+                       if slug_re.match(p.name))
+        print(f"# reclassify: {len(files)} candidate files", file=sys.stderr)
+        from vector_store import TAG_VOCAB as _VOCAB
+        for p in files:
+            slug = slug_re.match(p.name).group(1)
+            tpath = args.out / f"{slug}.transcript.txt"
+            if not tpath.exists():
+                print(f"  skip {slug}: no transcript sidecar", file=sys.stderr)
+                continue
+            text = tpath.read_text(encoding="utf-8")
+            tags = classify_transcript(api_key, text, _VOCAB)
+            _set_tags(index_conn, slug, tags)
+            _write_tags_to_frontmatter(p, tags)
+            print(f"  {slug}: {','.join(tags) if tags else '(no tags)'}", file=sys.stderr)
+        index_conn.close()
+        return 0
+
     skipped = 0
     try:
         for u in args.urls:
@@ -547,6 +644,20 @@ def main() -> int:
             result = process_one(api_key, slug, "", args.out, mode, index_conn)
             if result == 1:
                 skipped += 1
+                continue
+            # ponytail: --classify adds one cheap Gemini call (~1s, 64 output tokens)
+            # per successful analyze. Skipped silently on classification failure.
+            if getattr(args, "classify", False):
+                tpath = args.out / f"{slug}.transcript.txt"
+                if tpath.exists():
+                    from vector_store import set_tags as _set_tags, TAG_VOCAB as _VOCAB
+                    tags = classify_transcript(api_key,
+                                               tpath.read_text(encoding="utf-8"),
+                                               _VOCAB)
+                    _set_tags(index_conn, slug, tags)
+                    _write_tags_to_frontmatter(tpath.with_suffix(".md"), tags)
+                    print(f"  classify: {','.join(tags) if tags else '(no tags)'}",
+                          file=sys.stderr)
     finally:
         index_conn.close()
 
