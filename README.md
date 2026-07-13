@@ -191,15 +191,32 @@ Read `REQUIREMENTS.md` first if you want to know what's *not* built and why.
 
 ## Status (as of 2026-07-12)
 
-- 9 analyzed videos across this corpus; 40,030 unique YouTube URLs in
-  Takeout waiting to be processed.
-- The pipeline works for batches up to ~50 with current scripts; cross-day
-  resume is real.
-- The corpus is too small to need embeddings. Bundle-and-ask handles 38 KB
-  today; vector store becomes worth building at ~60 KB of corpus or when a
-  real question fails.
-- Free-tier Gemini quota is the binding constraint on processing speed
-  (50–200 text-mode calls/day).
+- 9 analyzed videos in the corpus; 40,030 unique YouTube URLs in Takeout
+  waiting to be processed.
+- Pipeline supports `--resume` with state file: walk the corpus across
+  many runs at Gemini free-tier pace (50–200 text-mode calls/day).
+- Vector store is **built**: `sqlite-vec` + `sentence-transformers/
+  all-MiniLM-L6-v2` (384-dim). 75 chunks indexed across 3 transcripts;
+  `ask.py --all` uses cosine top-k, `bin/chat.py` uses it per turn.
+- Multi-turn chat works: `bin/chat.py` REPL with persisted history
+  (8-message cap per turn).
+
+## Recent changes
+
+The full history lives in `git log`. Most recent commits (newest first):
+
+| commit | what |
+|---|---|
+| `8a595f8` | Multi-turn chat REPL (`bin/chat.py`) + chat-store functions in `bin/vector_store.py` |
+| `2cb4de5` | README refresh: vector-store / show-chunks / chat rows |
+| `92fde63` | `--show-chunks` flag in `ask.py` — print raw retrieved transcript excerpts |
+| `db2cfb4` | Vector store flipped to built; `docs/SEMANTIC-SEARCH.md` retired |
+| `49e2a7a` | Semantic search end-to-end: sqlite-vec + sentence-transformers |
+| `0e0d2a8` | Deferred-rung doc for semantic search (later built) |
+| `1d6cd62` | Initial commit: pipeline + RAG + Takeout ingest |
+
+Run `git log --oneline` for the full list, or see
+[commits on GitHub](https://github.com/azim12086atmes-s/YouTube-Knowledge-Base/commits/master).
 
 ## License
 
