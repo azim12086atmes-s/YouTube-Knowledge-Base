@@ -27,14 +27,18 @@ Notes (ponytail):
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 import zipfile
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from xml.etree import ElementTree as ET
 
 DOWNLOADS = Path.home() / "Downloads"
 WANT_KEY = "watch-history.json"
+_XLSX_NS = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+_ID_RE = re.compile(r"(?:v=|youtu\.be/|/)([A-Za-z0-9_-]{11})")
 
 
 def slug_from_url(url: str) -> str:
@@ -93,6 +97,130 @@ def source_takeout_watch_all(zp: Path) -> list[dict]:
     return sorted(source_takeout_watch(zp), key=lambda r: r["ts"])
 
 
+# ponytail: xlsx/urlfile sources added when non-Takeout URL files existed in
+# ~/Downloads (2026-07-13). Stdlib only — openpyxl is a much heavier install
+# for what is, under the hood, a zipfile of XML.
+def _xlsx_rows(path: Path) -> list[list[str]]:
+    """Yield rows from the first worksheet of an xlsx. Handles sharedStrings
+    AND inlineStr. Stdlib only — no openpyxl dep."""
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall("s:si", _XLSX_NS):
+                shared.append("".join((t.text or "")
+                                      for t in si.findall(".//s:t", _XLSX_NS)))
+        sheets = sorted(n for n in names
+                        if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        if not sheets:
+            return []
+        ws = ET.fromstring(zf.read(sheets[0]))
+        rows: list[list[str]] = []
+        for row in ws.findall("s:sheetData/s:row", _XLSX_NS):
+            vals: list[str] = []
+            for c in row.findall("s:c", _XLSX_NS):
+                t = c.attrib.get("t", "n")
+                if t == "inlineStr":
+                    is_el = c.find("s:is", _XLSX_NS)
+                    txt = ""
+                    if is_el is not None:
+                        txt = "".join((tt.text or "")
+                                      for tt in is_el.findall(".//s:t", _XLSX_NS))
+                    vals.append(txt)
+                    continue
+                v = c.find("s:v", _XLSX_NS)
+                if v is None or v.text is None:
+                    vals.append("")
+                elif t == "s":
+                    idx = int(v.text)
+                    vals.append(shared[idx] if idx < len(shared) else "")
+                else:
+                    vals.append(v.text)
+            rows.append(vals)
+        return rows
+
+
+def _extract_url_ids(*texts: str) -> list[str]:
+    """Pull YouTube IDs out of free text — handles watch URLs, youtu.be, bare IDs."""
+    ids: list[str] = []
+    for t in texts:
+        if not t:
+            continue
+        for m in _ID_RE.finditer(t):
+            ids.append(m.group(1))
+    return ids
+
+
+def source_xlsx(path: Path) -> list[dict]:
+    """URLs from an Excel file: any cell whose text contains a YouTube id."""
+    rows = _xlsx_rows(path)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r in rows:
+        for cell in r:
+            if not isinstance(cell, str):
+                continue
+            for vid in _extract_url_ids(cell):
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                out.append({"id": vid,
+                            "url": f"https://www.youtube.com/watch?v={vid}",
+                            "ts": "", "title": "", "channel": ""})
+    return out
+
+
+# ponytail: plain text/JSONL/JSON URL lists. Heuristic — if line starts with
+# '{' parse JSON and look for `url` / `titleUrl` / `link`; else treat as raw
+# URL/id. Cheap and most scrapers output one of these shapes.
+def source_urlfile(path: Path) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        url = ""
+        title = ""
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict):
+                url = (obj.get("url") or obj.get("titleUrl")
+                       or obj.get("link") or obj.get("video_url") or "")
+                title = obj.get("title") or ""
+        else:
+            url = line
+        for vid in _extract_url_ids(url):
+            if vid in seen:
+                continue
+            seen.add(vid)
+            out.append({"id": vid,
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "ts": "", "title": title, "channel": ""})
+    return out
+
+
+def pick_xlsx_or_urlfile(path: Path | None) -> Path:
+    """If user passed a file: use it. Else auto-discover the first non-empty
+    xlsx in DOWNLOADS (the only known URL-list format today)."""
+    if path:
+        if not path.is_file():
+            raise SystemExit(f"not a file: {path}")
+        return path
+    candidates = sorted(DOWNLOADS.glob("extracted_youtube_urls*.xlsx"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
+    for c in candidates:
+        if source_xlsx(c):
+            return c
+    raise SystemExit(
+        f"no non-empty URL-list xlsx in {DOWNLOADS}; pass --file PATH"
+    )
+
+
 def pick_takeout_zip(args_path: Path | None) -> Path:
     if args_path:
         if not args_path.is_file():
@@ -113,9 +241,28 @@ def pick_takeout_zip(args_path: Path | None) -> Path:
 
 
 def sample(records: list[dict], n: int) -> list[dict]:
-    """Pick n entries evenly across `YYYY-MM` buckets."""
+    """Pick n entries evenly across `YYYY-MM` buckets.
+
+    ponytail: xlsx/urlfile sources have no timestamp → no month buckets →
+    fall back to a deterministic `n` strided across the list.
+    """
     if n <= 0 or len(records) <= n:
         return sorted(records, key=lambda r: r["ts"])
+    # ponytail: if no record carries a usable YYYY-MM prefix, the bucketing
+    # collapses to one bucket (last per month == last in list). Detect and
+    # stride evenly instead — that's what the caller actually wants when the
+    # input has no temporal metadata (xlsx / urlfile sources).
+    has_months = any(r["ts"][:7] for r in records)
+    if not has_months:
+        # ponytail: deterministic stride for chronoless sources; ensure the
+        # last element lands by padding with it when stride is coarser than N.
+        if not records:
+            return []
+        step = max(1, len(records) // n)
+        out = [records[i] for i in range(0, len(records), step)][:n]
+        if len(out) < n:
+            out.append(records[-1])
+        return out[:n] 
 
     buckets: dict[str, list[dict]] = defaultdict(list)
     for r in records:
@@ -146,13 +293,18 @@ def emit(records: list[dict]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--source", default="takeout-watch",
-                   help="URL source: takeout-watch (sample, default), "
-                        "takeout-watch-all (full chronological scan).")
+                   help="URL source: takeout-watch (sample, default) | "
+                        "takeout-watch-all (full chronological scan) | "
+                        "xlsx (Excel URL list) | urlfile (txt/jsonl/JSON list)")
     # ponytail: positional zip kept for backward compat with pipeline.py / shell aliases.
     p.add_argument("zip_pos", nargs="?", type=Path, default=None,
-                   help="(deprecated, prefer --zip)")
+                   help="(deprecated, prefer --zip or --file)")
     p.add_argument("--zip", type=Path, default=None,
-                   help="path to Takeout zip (only used with takeout-watch / takeout-watch-all)")
+                   help="path to Takeout zip (only with takeout-watch / "
+                        "takeout-watch-all)")
+    p.add_argument("--file", type=Path, default=None,
+                   help="path to xlsx / txt / jsonl URL file (only with "
+                        "xlsx / urlfile)")
     p.add_argument("--n", type=int, default=6)
     # ponytail: for takeout-watch-all, --start-index / --limit enable resume.
     # Sample mode (default) ignores these.
@@ -163,11 +315,27 @@ def main() -> int:
     args = p.parse_args()
     args.zip = args.zip or args.zip_pos
 
-    if args.source not in ("takeout-watch", "takeout-watch-all"):
+    if args.source not in ("takeout-watch", "takeout-watch-all",
+                           "xlsx", "urlfile"):
         print(f"unknown --source {args.source!r}; "
-              f"only takeout-watch and takeout-watch-all are implemented",
+              f"expected takeout-watch | takeout-watch-all | xlsx | urlfile",
               file=sys.stderr)
         return 2
+
+    if args.source in ("xlsx", "urlfile"):
+        fp = pick_xlsx_or_urlfile(args.file)
+        if args.source == "xlsx":
+            records = source_xlsx(fp)
+        else:
+            records = source_urlfile(fp)
+        if not records:
+            print(f"no YouTube URLs found in {fp}", file=sys.stderr)
+            return 2
+        picks = sample(records, args.n) if args.n > 0 else records
+        print(f"# source: {args.source}  file: {fp}", file=sys.stderr)
+        print(f"# records: {len(records)}  sampled: {len(picks)}", file=sys.stderr)
+        emit(picks)
+        return 0
 
     zp = pick_takeout_zip(args.zip)
 

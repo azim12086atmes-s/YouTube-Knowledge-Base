@@ -85,6 +85,7 @@ for script, must_have in [
     ("ask.py", "--all"),
     ("chat.py", "--session"),
     ("pipeline.py", "--resume"),
+    ("list.py", "--tag"),
     ("vector_store.py", "OK  vector_store self-check passed"),
 ]:
     rc = run([sys.executable, str(BIN / script), "--help"])
@@ -159,6 +160,57 @@ conn = sqlite3.connect(str(IDX))
 conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session,))
 conn.commit()
 conn.close()
+
+# 7b. chat.py :tag filter (D4 REPL parity with ask.py --tag).
+session_tag = f"e2e_tag_{int(time.time())}"
+tag_input = (":tag ai-tooling\n:tag\nwho am i\n:quit\n")
+rc = subprocess.run([sys.executable, str(BIN / "chat.py"),
+                     "--session", session_tag], input=tag_input,
+                    capture_output=True, text=True, timeout=60)
+# Two asserts: (a) :tag ai-tooling set succeeded; (b) retrieval honor print
+# mentions the filter. (We don't run a real Gemini call here — only the
+# REPL commands — to keep the check fast.)
+ok = (rc.returncode == 0
+      and "active tag set to 'ai-tooling'" in rc.stdout
+      and "tag filter active: 'ai-tooling'" in rc.stderr)
+check("chat.py: :tag filter applies during retrieval", ok,
+      f"rc={rc.returncode} stdout_excerpt={rc.stdout[:200]!r}")
+conn = sqlite3.connect(str(IDX))
+conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_tag,))
+conn.execute("DELETE FROM session_state WHERE session_id = ?", (session_tag,))
+conn.commit(); conn.close()
+
+# 8. list.py: corpus inventory. (D12.)
+rc = run([sys.executable, str(BIN / "list.py")], timeout=30)
+ok = (rc.returncode == 0 and "M1E4ZzdpOco" in rc.stdout
+      and "wgOOBW3CJIY" in rc.stdout
+      and "ok" in rc.stdout)
+check("list.py: surfaces corpus + tags", ok,
+      f"rc={rc.returncode} out_len={len(rc.stdout)}")
+
+rc = run([sys.executable, str(BIN / "list.py"), "--mode", "transcript"],
+         timeout=30)
+ok = rc.returncode == 0 and "multimodal" not in rc.stdout
+check("list.py --mode transcript: filters", ok,
+      f"rc={rc.returncode}")
+
+rc = run([sys.executable, str(BIN / "list.py"),
+          "--tag", "ai-tooling", "--tag", "history-or-politics"],
+         timeout=30)
+ok = (rc.returncode == 0
+      and "M1E4ZzdpOco" in rc.stdout
+      and "wgOOBW3CJIY" in rc.stdout
+      and "9nAB-AC5ngE" not in rc.stdout)
+check("list.py --tag (union): filters", ok,
+      f"rc={rc.returncode}")
+
+rc = run([sys.executable, str(BIN / "list.py"), "--outcome", "skip-junk"],
+         timeout=30)
+ok = (rc.returncode == 0
+      and "skip-junk" in rc.stdout
+      and "ok" not in rc.stdout.split("# ok")[-1] if "# ok" in rc.stdout else True)
+check("list.py --outcome: filters", ok,
+      f"rc={rc.returncode}")
 
 # Summary.
 print()

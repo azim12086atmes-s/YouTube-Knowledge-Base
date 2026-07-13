@@ -63,8 +63,14 @@ def gemini_key() -> str:
     raise SystemExit("GEMINI_API_KEY missing from ~/.hermes/.env")
 
 
-def retrieve_chunks(idx_path: Path, question: str, k: int = 8) -> list[dict]:
-    """Open the corpus index, run a vector search, return hits."""
+def retrieve_chunks(idx_path: Path, question: str, k: int = 8,
+                    allowed_slugs=None) -> list[dict]:
+    """Open the corpus index, run a vector search, return hits.
+
+    ponytail: when allowed_slugs is provided, filter hits to that set
+    AFTER retrieval. fetch_k doubled so post-filter doesn't shrink the
+    visible set under k. Used by :tag filter.
+    """
     if not idx_path.exists():
         return []
     try:
@@ -73,13 +79,61 @@ def retrieve_chunks(idx_path: Path, question: str, k: int = 8) -> list[dict]:
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         from vector_store import search as vec_search
-        hits = vec_search(conn, question, k=k)
+        fetch_k = k * 2 if allowed_slugs else k
+        hits = vec_search(conn, question, k=fetch_k)
         conn.close()
+        if allowed_slugs is not None:
+            hits = [h for h in hits if h['slug'] in allowed_slugs][:k]
         return hits
     except Exception as e:
         print(f"# retrieve failed ({type(e).__name__}: {e}); "
               f"continuing without retrieval", file=sys.stderr)
         return []
+
+
+
+
+# ponytail: session-scoped key/value state lives in its own table.
+# Currently only `tag` is stored (active tag filter). Schema is open-ended
+# so future keys (last_retrieval_mode, history_cap_override, ...) land here.
+SESSION_STATE_SQL = """
+    CREATE TABLE IF NOT EXISTS session_state (
+        session_id TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        value      TEXT,
+        PRIMARY KEY (session_id, key)
+    )
+"""
+
+
+def init_session_state(conn):
+    conn.execute(SESSION_STATE_SQL)
+    conn.commit()
+
+
+def get_session_kv(conn, session_id, key):
+    init_session_state(conn)
+    row = conn.execute(
+        "SELECT value FROM session_state WHERE session_id=? AND key=?",
+        (session_id, key),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def set_session_kv(conn, session_id, key, value):
+    init_session_state(conn)
+    if value is None:
+        conn.execute(
+            "DELETE FROM session_state WHERE session_id=? AND key=?",
+            (session_id, key),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO session_state(session_id, key, value) VALUES(?,?,?) "
+            "ON CONFLICT(session_id, key) DO UPDATE SET value=excluded.value",
+            (session_id, key, value),
+        )
+    conn.commit()
 
 
 def build_contents(history: list[dict], question: str,
@@ -157,11 +211,13 @@ def repl(idx_path: Path, session_id: str, k: int) -> int:
     except Exception:
         pass
 
-    from vector_store import load_messages, save_message, clear_session, list_sessions
+    from vector_store import (load_messages, save_message, clear_session,
+                             list_sessions, init_tags, get_slugs_by_tag)
+    init_tags(conn)
 
     print(f"chat: session={session_id!r}  index={idx_path}")
-    print(f"type a question. commands: :quit :clear :status :show :history :sessions")
-    last_hits: list[dict] = []
+    print(f"type a question. commands: :quit :clear :status :show :history :sessions :tag [name]")
+    last_hits: list[dict] = []  # ponytail: shared with :show
 
     while True:
         try:
@@ -208,13 +264,39 @@ def repl(idx_path: Path, session_id: str, k: int) -> int:
                 for s in list_sessions(conn):
                     print(f"  {s['session_id']:20s} count={s['count']}")
                 continue
+            # ponytail: :tag [name] — set / show / clear the session tag filter.
+            # Argument is everything after "tag"; empty arg shows current filter.
+            if cmd.startswith("tag"):
+                arg = cmd[3:].strip()
+                if not arg:
+                    cur = get_session_kv(conn, session_id, "tag")
+                    print(f"active tag: {cur if cur else '(none)'}")
+                    continue
+                from vector_store import TAG_VOCAB as _vocab, get_slugs_by_tag as _g
+                if arg not in _vocab:
+                    print(f"unknown tag {arg!r}; valid: {', '.join(_vocab)}")
+                    continue
+                count = len(_g(conn, arg))
+                set_session_kv(conn, session_id, "tag", arg)
+                print(f"active tag set to {arg!r} ({count} slug(s) match)")
+                continue
             print(f"unknown command: {cmd!r}")
             continue
 
         # Real turn.
         save_message(conn, session_id, "user", line)
         history = load_messages(conn, session_id, limit=HISTORY_CAP)
-        last_hits = retrieve_chunks(idx_path, line, k=k)
+        # ponytail: apply the session's active tag filter to retrieval.
+        # allowed=None when no filter is set; set() of slugs otherwise.
+        active = get_session_kv(conn, session_id, "tag")
+        allowed: set[str] | None = None
+        if active:
+            from vector_store import get_slugs_by_tag as _g
+            allowed = _g(conn, active)
+        last_hits = retrieve_chunks(idx_path, line, k=k, allowed_slugs=allowed)
+        if active:
+            print(f"# tag filter active: {active!r} ({len(allowed)} slug(s))",
+                  file=sys.stderr)
         contents = build_contents(history, line, last_hits)
         reply = call_gemini(api_key, contents)
         if reply.startswith("ERROR"):

@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SAMPLE = HERE / "takeout_sample.py"
+URL_SOURCE = HERE / "url_source.py"      # ponytail: was takeout_sample.py
 ANALYZE = HERE / "analyze.py"
 DEFAULT_OUT = Path.home() / "Documents" / "video-analysis"
 # ponytail: pipeline state lives next to the corpus. Tracks cursor across runs
@@ -77,7 +77,11 @@ def save_state(state: dict) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("zip", nargs="?", type=Path, default=None,
-                   help="path to Takeout zip; default: most-recent JSON-form in ~/Downloads")
+                   help="path to Takeout zip / URL-list file; default depends on --source")
+    p.add_argument("--source", default="takeout-watch",
+                   help="URL source (forwarded to url_source.py): "
+                        "takeout-watch (default) | takeout-watch-all | "
+                        "xlsx | urlfile")
     p.add_argument("--n", type=int, default=6, help="videos to sample (default: 6)")
     p.add_argument("--out", type=Path, default=DEFAULT_OUT,
                    help=f"output directory (default: {DEFAULT_OUT})")
@@ -94,8 +98,8 @@ def main() -> int:
                    help="with --resume: ignore saved cursor; start from index 0")
     args = p.parse_args()
 
-    if not SAMPLE.exists():
-        print(f"missing {SAMPLE}", file=sys.stderr); return 2
+    if not URL_SOURCE.exists():
+        print(f"missing {URL_SOURCE}", file=sys.stderr); return 2
     if not ANALYZE.exists() and not args.dry_run:
         print(f"missing {ANALYZE}", file=sys.stderr); return 2
     if not shutil.which(sys.executable):
@@ -111,7 +115,7 @@ def main() -> int:
         # ponytail: chronological scan starting at saved cursor. analyze.py's
         # SQLite index handles dedup, so re-running on already-written slugs
         # is a fast no-op (we still advance cursor for each attempted URL).
-        sample_cmd = [sys.executable, str(SAMPLE),
+        sample_cmd = [sys.executable, str(URL_SOURCE),
                       "--source", "takeout-watch-all",
                       "--start-index", str(state["cursor_index"]),
                       "--limit", str(args.batch_size)]
@@ -129,14 +133,19 @@ def main() -> int:
         print(f"# resumed at cursor={state['cursor_index']}; batch={len(records)}",
               file=sys.stderr)
     else:
-        # Step 1: sample (default behavior, backward-compatible)
-        sample_cmd = [sys.executable, str(SAMPLE)]
+        # Step 1: sample (default behavior, backward-compatible).
+        # ponytail: source + filepath dispatch to url_source.py; for xlsx/urlfile
+        # the "zip" arg is repurposed as the file path.
+        sample_cmd = [sys.executable, str(URL_SOURCE),
+                      "--source", args.source, "--n", str(args.n)]
         if args.zip:
-            sample_cmd.append(str(args.zip))
-        sample_cmd += ["--n", str(args.n)]
+            if args.source in ("xlsx", "urlfile"):
+                sample_cmd += ["--file", str(args.zip)]
+            else:
+                sample_cmd += [str(args.zip)]
         rc, so, se = run(sample_cmd)
         if rc != 0:
-            print(f"takeout_sample.py failed (rc={rc}):\n{se}", file=sys.stderr)
+            print(f"url_source.py failed (rc={rc}):\n{se}", file=sys.stderr)
             return 2
         records = parse_sample(so)
         if not records:

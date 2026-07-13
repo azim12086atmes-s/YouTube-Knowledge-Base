@@ -33,6 +33,8 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 | Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
 | Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
 | Chat interface (multi-turn, conversation memory, UI) | ✓ — `bin/chat.py` REPL. Per-session history persisted in `chat_messages` table; retrieval + history injection per turn. CLI today; UI is a future rung gated on user request. |
+| Chat `:tag` filter (per-session, applied to retrieval) | ✓ — `chat.py :tag <name>` sets, `:tag` shows. Filter persisted in `session_state` table. Retrieval re-ranks inside the active tag's slugs. |
+| Corpus inventory / list CLI | ✓ — `bin/list.py [--tag] [--mode] [--outcome] [--limit]` queries `analyzed_videos` + `tag_assignments` in one call. Surfaces what's analyzed, by tag, by mode, by outcome. |
 | Query raw transcript chunks verbatim | ✓ — `ask.py --show-chunks` prints top-k retrieved excerpts with slug + cosine distance before the LLM answer |
 | Classification (auto-tag into fixed vocab) | ✓ — `analyze.py --classify` / `--reclassify`. 9-tag vocabulary (ai-tooling, founder-psychology, investing, personal-development, religion-or-faith, history-or-politics, music-or-performance, lifestyle-or-cooking, other). |
 | Set-logic recall (union/intersection across tags) | ✓ — `ask.py --tag <t>` (repeatable: `--tag a --tag b` = either); tag CRUD in `tag_assignments` table. |
@@ -191,6 +193,38 @@ python bin/ask.py --all --tag investing --tag founder-psychology --question "wha
 
 `--tag` requires the SQLite index to exist; `analyze.py --reindex-from-md`
 populates it.
+
+### List what's in the corpus
+
+```bash
+python bin/list.py                       # every analyzed video
+python bin/list.py --tag ai-tooling     # filter to one (or many) tags
+python bin/list.py --mode multimodal    # only multimodal-mode analyses
+python bin/list.py --outcome skip-junk  # only skips (e.g. transcript-disabled)
+python bin/list.py --limit 10           # last 10 analyzed
+```
+
+Output is one row per slug with `mode | outcome | tags | analyzed_on`.
+Filters compose: `--tag x --tag y` is union (slug matching either). Useful
+for "what do I actually have right now?" without opening Obsidian.
+
+### Tag-filter the chat REPL
+
+Inside `bin/chat.py` you can pin a session to one tag and every retrieval
+will be re-ranked to top-k chunks from slugs carrying that tag:
+
+```
+chat: session='default' ... commands: :quit :clear :status :show :history :sessions :tag [name]
+[default] > :tag ai-tooling
+active tag set to 'ai-tooling' (1 slug(s) match)
+[default] > what does this speaker say about building software?
+... answer drawn from M1E4ZzdpOco only ...
+[default] > :tag
+active tag: ai-tooling
+```
+
+`:tag [name]` sets, bare `:tag` shows. New sessions default to no filter.
+State is per-session, persisted in `session_state`.
 
 ### What channels do I watch most?
 
