@@ -239,6 +239,19 @@ try:
 except Exception as e:
     check("D19: vector index reachable", False, f"{type(e).__name__}: {e}")
 
+# 7i. D21: requirements.txt present + matches the dev venv.
+from pathlib import Path
+import importlib.metadata as _md
+_req_lines = Path("requirements.txt").read_text().splitlines()
+_pin_lines = [ln for ln in _req_lines
+              if ln.strip() and not ln.lstrip().startswith("#")]
+# ponytail: strip the trailing `# comment` so pin comparison is exact.
+_pkgs = [tuple(ln.split("#", 1)[0].strip().split("==", 1))
+         for ln in _pin_lines if "==" in ln]
+ok = bool(_pkgs) and all(_md.version(n) == v for n, v in _pkgs)
+check("D21: requirements.txt pins match dev venv", ok,
+      f"{[(n, _md.version(n), v) for n, v in _pkgs]}")
+
 # 7h. D20: backfill_watched_at script surface + --watched-at CLI on analyze.
 import re as _re
 n_unknown_after = sum(

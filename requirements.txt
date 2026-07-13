@@ -1,0 +1,8 @@
+# Pinned deps for video-pipeline.
+# ponytail: only the four packages actually used; each line is the
+# exact version present in the dev venv on 2026-07-13.
+
+google-genai==2.11.0          # Gemini SDK — analyze.py + _gemini.py POSTs
+sentence-transformers==5.6.0  # all-MiniLM-L6-v2 embeddings (384-dim)
+sqlite-vec==0.1.9             # vec0 virtual table for the chunks index
+youtube-transcript-api==1.2.4 # youtube-content skill helper (fetch_transcript)

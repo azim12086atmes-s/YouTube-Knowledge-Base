@@ -50,9 +50,13 @@ zip into a searchable, question-answerable corpus of plain-text summaries.
 git clone <repo-url> video-pipeline
 cd video-pipeline
 
-# 2. Python deps — stdlib + google-genai + youtube-transcript-api
-#    + sentence-transformers + sqlite-vec (for vector search, ~250 MB on disk)
-pip install google-genai youtube-transcript-api sentence-transformers sqlite-vec
+# 2. Python deps — pinned to the exact versions used in development.
+#    (For historical / reproduction purposes; in practice `pip install
+#    -U` of these names is fine.)
+pip install -r requirements.txt
+# Or, equivalently, the un-pinned form (still in the README's "what to
+# install" narrative, but require the file from here on):
+#   pip install google-genai youtube-transcript-api sentence-transformers sqlite-vec
 
 # 3. API key
 echo 'GEMINI_API_KEY=YOUR_KEY_HERE' >> ~/.hermes/.env
