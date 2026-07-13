@@ -202,14 +202,20 @@ Each analyzed video gets classified into one of nine fixed tags:
 `ai-tooling`, `founder-psychology`, `investing`, `personal-development`,
 `religion-or-faith`, `history-or-politics`, `music-or-performance`,
 `lifestyle-or-cooking`, `other`. Tags are persisted in a SQLite table
-and written back to the front-matter of the analysis file.
+and written back to the front-matter of the analysis file. Multimodal-mode
+analyses (no transcript sidecar) are classified from their markdown
+body via `--reclassify-from-md`.
 
 ```bash
 # Tag as part of a fresh analyze:
 python bin/analyze.py "https://youtu.be/<id>" --classify
 
-# Re-tag every existing markdown in the corpus (one Gemini call each):
+# Re-tag every existing markdown file in --out (one Gemini call each):
 python bin/analyze.py --reclassify
+
+# Re-tag from markdown body — covers multimodal-mode analyses that
+# have no transcript sidecar:
+python bin/analyze.py --reclassify-from-md
 
 # Ask a question, restricting to a single tag:
 python bin/ask.py --all --tag ai-tooling --question "what does the speaker say about building software?"
@@ -268,6 +274,57 @@ empty or "unknown", so it never overrides a more-specific value.
 Recent ingests via `pipeline.py` auto-populate `watched_at` from the
 upstream `time` field — no manual backfill needed for new runs.
 
+### URL lists beyond Takeout (xlsx / txt / jsonl)
+
+If your URLs aren't inside a Takeout zip — say, a Microsoft Excel dump
+of "videos to watch," a plain `.txt` file with one URL per line, or a
+JSONL feed from a scraper — pass them to the same pipeline:
+
+```bash
+# xlsx: auto-discovers ext*cted_youtube_urls*.xlsx in ~/Downloads/
+python bin/pipeline.py --source xlsx
+
+# txt / jsonl / raw URLs: file is the path
+python bin/url_source.py --source urlfile --file my_urls.txt --n 50
+```
+
+Stdlib-only (zipfile + ElementTree, no openpyxl). The xlsx parser
+handles both `sharedStrings.xml` and inline-string cells. The urlfile
+parser picks one URL per non-comment line; JSON lines are parsed for
+`url` / `titleUrl` / `link` keys and the title is preserved for the
+front-matter.
+
+### Retry skips + reindex from markdown body
+
+Two cheap recovery commands when the corpus gets stale:
+
+```bash
+# Re-run every outcome LIKE 'skip%' row (uploader captions sometimes
+# reappear days later):
+python bin/analyze.py --retry-skips
+
+# Backfill the SQLite vector index from existing markdown files.
+# Covers every OK file even when analyze.py wasn't called with
+# sqlite_vec loaded:
+python bin/analyze.py --reindex-from-md
+```
+
+`--reindex-from-md` is also the recovery path when the index goes
+missing or gets corrupted — every markdown file in `--out` is re-embedded
+(transcript sidecar when present; markdown body `## 1. Summary` + `## 2.
+Key Takeaways` otherwise).
+
+### Architecture comparison with NotebookLM
+
+`docs/ARCHITECTURE.md` is a one-page side-by-side with Google
+NotebookLM: which NotebookLM features this pipeline transfers
+(transcript-only ingest, source select, evidence-span IDs, inline
+citations, refusal-on-no-evidence), which are rung-1 holds (click-through
+timestamp anchors, reranker, hybrid retrieval, audio overview,
+hosted service), and which we deliberately reject. Read it before
+making changes that look like "we should add a hosted multi-corpus
+mode" or "let's swap in a reranker."
+
 ### What channels do I watch most?
 
 ```bash
@@ -315,43 +372,39 @@ caption extraction).
 | `docs/CONVENTIONS.md` | The Markdown front-matter schema. What fields every `<slug>.md` must have. |
 | `docs/REQUIREMENTS.md` | Status of every feature: built, deferred, rejected. Each deferred item names its trigger. |
 | `docs/ANALYSIS-FALLBACK.md` | Why shorts fail to analyze today. 3-tier fallback design (transcript → multimodal audio → local STT). |
-| `docs/SEMANTIC-SEARCH.md` | Why `ask.py` doesn't do semantic search today, what it costs to add, and the trigger that earns the build. |
+| `docs/ARCHITECTURE.md` | One-page side-by-side with Google NotebookLM's RAG — what this pipeline transfers, what we deliberately skip, and why. |
 
 Read `REQUIREMENTS.md` first if you want to know what's *not* built and why.
+Read `ARCHITECTURE.md` before adding any feature that looks like the
+NotebookLM equivalents of hosted multi-corpus, reranker, or audio overview.
 
-## Status (as of 2026-07-12)
+## Status (as of 2026-07-13)
 
-- 9 analyzed videos in the corpus; 40,030 unique YouTube URLs in Takeout
-  waiting to be processed.
+- 8 analyzed videos in the corpus (6 multimodal-mode + 2 transcript-mode);
+  40,030 unique YouTube URLs in Takeout waiting to be processed.
 - Pipeline supports `--resume` with state file: walk the corpus across
   many runs at Gemini free-tier pace (50–200 text-mode calls/day).
-- Vector store is **built**: `sqlite-vec` + `sentence-transformers/
-  all-MiniLM-L6-v2` (384-dim). 75 chunks indexed across 3 transcripts;
-  `ask.py --all` uses cosine top-k, `bin/chat.py` uses it per turn.
-- Multi-turn chat works: `bin/chat.py` REPL with persisted history
-  (8-message cap per turn).
+- Vector store is **built and complete**: `sqlite-vec` +
+  `sentence-transformers/all-MiniLM-L6-v2` (384-dim). 111 chunks indexed
+  across **8 of 8** OK files (the 5 multimodal-mode files are embedded
+  from their `## 1. Summary` + `## 2. Key Takeaways` body, not transcripts).
+- Multi-turn chat works: `bin/chat.py` REPL and `bin/web.py` HTTP
+  wrapper. Per-session history in `chat_messages`; per-session tag
+  filter via `:tag` in the REPL or per-request `tag` in `/api/query`.
 - Classification works: `analyze.py --classify` tags each analyzed video
-  from a fixed 9-tag vocabulary; `analyze.py --reclassify` re-tags existing
-  files. `ask.py --tag <t>` filters retrieval to slugs matching `<t>`.
+  from a fixed 9-tag vocabulary; `--reclassify-from-md` covers
+  multimodal-mode files (no transcript sidecar). 8 of 8 OK files tagged.
+- Source coverage: Takeout zip, .xlsx, .txt, .jsonl, raw URL lists.
+  All feed the same `pipeline.py` via `--source`.
+- 38 e2e probes pass in `bin/end_to_end_check.py`, ~2:35 wall.
 
 ## Recent changes
 
 The full history lives in `git log`. Most recent commits (newest first):
-
-| commit | what |
-|---|---|
-| *(this turn)* | D3 + D4: classification (`analyze.py --classify` / `--reclassify`) + tag-filter (`ask.py --tag`); fixed `p.stem` bug in `--all` slug extraction |
-| `ce42fcb` | End-to-end check script (`bin/end_to_end_check.py`) + README verify section |
-| `8a595f8` | Multi-turn chat REPL (`bin/chat.py`) + chat-store functions in `bin/vector_store.py` |
-| `2cb4de5` | README refresh: vector-store / show-chunks / chat rows |
-| `92fde63` | `--show-chunks` flag in `ask.py` — print raw retrieved transcript excerpts |
-| `db2cfb4` | Vector store flipped to built; `docs/SEMANTIC-SEARCH.md` retired |
-| `49e2a7a` | Semantic search end-to-end: sqlite-vec + sentence-transformers |
-| `0e0d2a8` | Deferred-rung doc for semantic search (later built) |
-| `1d6cd62` | Initial commit: pipeline + RAG + Takeout ingest |
-
-Run `git log --oneline` for the full list, or see
-[commits on GitHub](https://github.com/azim12086atmes-s/YouTube-Knowledge-Base/commits/master).
+D24 ARCHITECTURE.md, D23 Web UI, D22 --classify on multimodal, D21
+requirements.txt, D19+D20 vector-index-coverage + backfill_watched_at.
+Run `git log --oneline` for the rest, or browse on
+[GitHub](https://github.com/azim12086atmes-s/YouTube-Knowledge-Base/commits/master).
 
 ## License
 
