@@ -59,7 +59,33 @@ echo 'GEMINI_API_KEY=YOUR_KEY_HERE' >> ~/.hermes/.env
 
 # 5. (Optional) Backfill embeddings from existing transcripts:
 #    python bin/analyze.py --reindex-from-md
+
+# 6. Verify everything works end-to-end:
+python bin/end_to_end_check.py
+# Should print "OK  all end-to-end checks passed" against the bundled
+# corpus (3 transcripts with sidecars, 75 indexed chunks). If a check
+# fails, the README's "Verify it works" section explains each one.
 ```
+
+### Verify it works
+
+After install, run the end-to-end check to confirm the pipeline works
+against the bundled corpus:
+
+```bash
+python bin/end_to_end_check.py
+```
+
+It probes 11 things in ~10 seconds, using the live corpus + Gemini API:
+corpus files exist, vector index populated, CLI surfaces present,
+`ask.py --all` returns a real cited answer, `--show-chunks` works,
+`chat.py` REPL persists a turn.
+
+The bundled corpus has 8 markdown files (mixed multimodal + transcript-mode)
+but only 3 transcript sidecars — multimodal-mode analyses don't produce
+`.transcript.txt` sidecars (Gemini multimodal returns a 4-shape Markdown
+but doesn't save the raw transcript). Only transcript-mode analyses do.
+The check counts both.
 
 The scripts assume:
 
@@ -155,13 +181,14 @@ export today: top channels include `Dr. Scarry` (166), `Valuetainment` (144),
 ```
 video-pipeline/
 ├── bin/
-│   ├── analyze.py       # 1-URL → 4-shape Markdown + SQLite row
-│   ├── ask.py           # RAG over chosen/all transcripts (bundle-and-ask)
-│   ├── chat.py          # multi-turn REPL with history persistence
-│   ├── pipeline.py      # Takeout → sample → analyze; supports --resume
-│   ├── url_source.py    # URL sources (takeout-watch, takeout-watch-all)
-│   ├── vector_store.py  # chunk + embed + cosine search + chat persistence
-│   └── takeout_sample.py# Compatibility alias of url_source.py
+│   ├── analyze.py            # 1-URL → 4-shape Markdown + SQLite row
+│   ├── ask.py                # RAG over chosen/all transcripts (bundle-and-ask)
+│   ├── chat.py               # multi-turn REPL with history persistence
+│   ├── pipeline.py           # Takeout → sample → analyze; supports --resume
+│   ├── url_source.py         # URL sources (takeout-watch, takeout-watch-all)
+│   ├── vector_store.py       # chunk + embed + cosine search + chat persistence
+│   ├── end_to_end_check.py   # one runnable check that the pipeline works
+│   └── takeout_sample.py     # Compatibility alias of url_source.py
 ├── corpus -> ~/Documents/video-analysis   # symlink: outputs land here
 │   ├── <slug>.md                            # 4-shape analysis per video
 │   ├── <slug>.transcript.txt                # transcript sidecar
