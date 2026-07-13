@@ -5,7 +5,8 @@ Why this exists:
   Ponytail rule: non-trivial logic leaves a runnable check. The chat /
   ask / analyze pipeline is non-trivial. README promises "drop a Takeout,
   run ask.py, get an answer." This file proves that promise on the current
-  corpus (3 transcripts already analyzed, 75 chunks indexed).
+  corpus (3 transcripts already analyzed, 111 chunks indexed across 8 files
+  — multimodal-mode files are now embedded too, see D19).
 
 What it does:
   1. Asserts the corpus directory has the expected transcripts and markdown.
@@ -216,6 +217,42 @@ ok = (rc.returncode == 0
       and "source: takeout-watch" in rc.stderr
       and "| https://www.youtube.com/watch?v=" in rc.stdout)
 check("takeout_sample.py: back-compat shim works", ok,
+      f"rc={rc.returncode}")
+
+# 7g. D19: every successful analysis is in the vector index. If a markdown
+# file exists with outcome='ok' but zero chunks, retrieval is silently
+# blind to it — the user-facing bug the fix prevents.
+try:
+    import sqlite_vec as _vec
+    _conn = sqlite3.connect(str(IDX))
+    _conn.enable_load_extension(True)
+    _vec.load(_conn)
+    blind = _conn.execute(
+        "SELECT v.slug FROM analyzed_videos v "
+        "WHERE v.outcome='ok' AND NOT EXISTS "
+        "(SELECT 1 FROM chunk_meta m WHERE m.slug=v.slug)"
+    ).fetchall()
+    n_blind = len(blind)
+    check("D19: every ok-file is in the vector index", n_blind == 0,
+          f"blind slugs: {[r[0] for r in blind]}")
+    _conn.close()
+except Exception as e:
+    check("D19: vector index reachable", False, f"{type(e).__name__}: {e}")
+
+# 7h. D20: backfill_watched_at script surface + --watched-at CLI on analyze.
+import re as _re
+n_unknown_after = sum(
+    1 for f in CORPUS.glob("*.md")
+    if (m := _re.search(r"^watched_at:\s*(.*)$",
+                        f.read_text(encoding="utf-8"), _re.M))
+    and m.group(1).strip() in ("", "unknown")
+)
+check("D20: watched_at backfilled (corpus has ≤1 'unknown' left)", n_unknown_after <= 1,
+      f"unknown front-matter count: {n_unknown_after}")
+
+rc = run([sys.executable, str(BIN / "analyze.py"), "--help"], timeout=15)
+ok = "--watched-at" in rc.stdout
+check("analyze.py: --watched-at exposed", ok,
       f"rc={rc.returncode}")
 
 # 8. list.py: corpus inventory. (D12.)

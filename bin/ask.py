@@ -120,8 +120,12 @@ def main() -> int:
             slug = p.name.removesuffix(".transcript.txt")
             slugs.append(slug)
             transcripts.append(p.read_text(encoding="utf-8"))
-        print(f"# --all: {len(transcripts)} transcripts in {args.transcripts_dir}",
-              file=sys.stderr)
+        # ponytail: the corpus now includes multimodal-mode analyses embedded
+        # via body_text_for_indexing — those are visible to vector search but
+        # not to bundle-and-ask. The count below is the bundle source; the
+        # retrieval source is the indexed vector store.
+        print(f"# --all: {len(transcripts)} transcript sidecars; "
+              f"vector index covers more", file=sys.stderr)
     else:
         if not args.urls:
             print("error: no URLs given; pass positional URLs or --all",

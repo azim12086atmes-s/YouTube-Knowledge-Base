@@ -165,7 +165,11 @@ def main() -> int:
     cursor_advanced = 0
     for r in records:
         url = r["url"]
-        analyze_cmd = [sys.executable, str(ANALYZE), url, "--out", str(args.out)]
+        ts = r.get("ts", "") or ""
+        analyze_cmd = [sys.executable, str(ANALYZE), url,
+                       "--out", str(args.out)]
+        if ts:
+            analyze_cmd += ["--watched-at", ts]
         rc, so, se = run(analyze_cmd)
         out_path = args.out / f"{r['id']}.md"
         wrote = out_path.exists() and rc == 0

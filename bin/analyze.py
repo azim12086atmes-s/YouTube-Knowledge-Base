@@ -538,6 +538,10 @@ def process_one(api_key: str, slug: str, watched_at: str, out_dir: Path,
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("urls", nargs="*", help="YouTube URLs or 11-char video IDs")
+    p.add_argument("--watched-at", default="",
+                   help="ISO timestamp of when the user watched this video "
+                        "(from Takeout's `time` field). Lifted into front-matter; "
+                        "empty means 'unknown'.")
     p.add_argument("--out", type=Path, default=DEFAULT_OUT,
                    help=f"Output directory (default: {DEFAULT_OUT})")
     p.add_argument("--transcript", dest="transcript", action="store_true", default=True,
@@ -607,18 +611,25 @@ def main() -> int:
                             "transcript" if (mode_m and "transcript" in mode_m.group(1).lower())
                                        else "multimodal",
                             "ok", p)
-            # ponytail: if a transcript sidecar exists, embed it too. Public-clone
-            # users get the vector index populated without running analyze on each URL.
-            tpath = args.out / f"{slug_m.group(1)}.transcript.txt"
-            if tpath.exists():
+            # ponytail: index via the body-text helper so multimodal-mode files
+            # (no transcript sidecar) still get embedded. Text source is the
+            # transcript sidecar when present, otherwise ## 1. Summary + ## 2.
+            # Key Takeaways from the markdown body; upsert_chunks() is the
+            # single embedding path for both cases.
+            from vector_store import body_text_for_indexing, upsert_chunks
+            text = body_text_for_indexing(p)
+            if text.strip():
                 try:
-                    from vector_store import upsert_chunks
-                    n = upsert_chunks(index_conn, slug_m.group(1),
-                                      tpath.read_text(encoding="utf-8"))
-                    print(f"  embed: {slug_m.group(1)} -> {n} chunks", file=sys.stderr)
+                    n = upsert_chunks(index_conn, slug_m.group(1), text)
+                    src = "transcript" if (args.out / f"{slug_m.group(1)}.transcript.txt").exists() else "analysis-body"
+                    print(f"  embed: {slug_m.group(1)} -> {n} chunks [{src}]",
+                          file=sys.stderr)
                 except Exception as e:
                     print(f"  embed: skipped {slug_m.group(1)} "
                           f"({type(e).__name__}: {e})", file=sys.stderr)
+            else:
+                print(f"  embed: skipped {slug_m.group(1)} (no usable text)",
+                      file=sys.stderr)
             updated += 1
         # ponytail: remove prior bogus rows. Real YT IDs are mixed-case +
         # alphanumeric; pure-uppercase / pure-lower is unusual. Cheap filter.
@@ -709,6 +720,9 @@ def main() -> int:
                 continue
             url = row[0]
             print(f"  retry {slug}  ({url})", file=sys.stderr)
+            # ponytail: --watched-at is per-invocation (CLI), so a
+            # --retry-skips batch doesn't try to be smart about per-slug
+            # timestamps. Re-tries keep the original 'unknown' front-matter.
             r = process_one(api_key, slug, "", args.out, mode, index_conn)
             if r == 0:
                 recovered += 1
@@ -721,7 +735,8 @@ def main() -> int:
     try:
         for u in args.urls:
             slug = slug_from_url(u)
-            result = process_one(api_key, slug, "", args.out, mode, index_conn)
+            result = process_one(api_key, slug, args.watched_at, args.out,
+                                 mode, index_conn)
             if result == 1:
                 skipped += 1
                 continue

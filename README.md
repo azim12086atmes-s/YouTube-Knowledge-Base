@@ -226,6 +226,21 @@ active tag: ai-tooling
 `:tag [name]` sets, bare `:tag` shows. New sessions default to no filter.
 State is per-session, persisted in `session_state`.
 
+### Backfill watch-time into front-matter
+
+If you have a fresh Takeout zip and your existing analyses show
+`watched_at: unknown`, you can populate that field from the zip's
+watch-history:
+
+```bash
+python bin/backfill_watched_at.py --zip path/to/takeout-2024xxxxx.zip
+```
+
+Idempotent: only touches files where the front-matter is currently
+empty or "unknown", so it never overrides a more-specific value.
+Recent ingests via `pipeline.py` auto-populate `watched_at` from the
+upstream `time` field — no manual backfill needed for new runs.
+
 ### What channels do I watch most?
 
 ```bash

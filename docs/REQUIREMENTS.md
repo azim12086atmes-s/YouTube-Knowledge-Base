@@ -32,6 +32,8 @@ These are **explicitly NOT built today**. Each has a trigger — do not implemen
 | D16 | **Shared Gemini POST helper** (dedup across `analyze.py` / `ask.py` / `chat.py`) | ✓ **Shipped 2026-07-13**: `bin/_gemini.py` with `gemini_key()`, `post()`, `post_text()`. Three callers route through one function. Back-compat `gemini_key = _gemini_key` shims in each caller. |
 | D17 | **`takeout_sample.py` back-compat shim** (was a stale fork) | ✓ **Shipped 2026-07-13**: replaced stale duplicate with `from url_source import *` shim. README/project shape continues to reference both names. |
 | D18 | **`sample(n=1)` div-by-zero** (pre-existing latent bug in `url_source.py`) | ✓ **Fixed 2026-07-13**: explicit `n == 1` early-return so `--n 1` returns the latest-month entry instead of crashing on `n-1` divisor. |
+| D19 | **Vector index multimodal coverage** (embed markdown body when no transcript) | ✓ **Shipped 2026-07-13**: `vector_store.body_text_for_indexing()` picks transcript sidecar when present, falls back to `## 1. Summary` + `## 2. Key Takeaways` from the markdown body. `analyze.py --reindex-from-md` now embeds 5 previously-blind multimodal-mode files. Index coverage: 8 of 8 ok-files. |
+| D20 | **`watched_at` data drift in front-matter** (Takeout `time` was dropped on the floor) | ✓ **Shipped 2026-07-13**: `bin/backfill_watched_at.py --zip <takeout>` populates front-matter `watched_at:` from Takeout's `time` field (idempotent: only touches files where it's currently empty/unknown). New `analyze.py --watched-at` flag flows through `pipeline.py` so future ingests carry timestamps automatically. |
 
 ## What we explicitly rejected today
 

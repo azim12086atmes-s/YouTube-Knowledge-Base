@@ -128,6 +128,35 @@ def upsert_chunks(conn: sqlite3.Connection, slug: str,
     return inserted
 
 
+# ponytail: lift the "which text do we embed?" decision into one helper.
+# Multimodal-mode analyses have no transcript sidecar; the search corpus
+# shouldn't be missing 5 of 8 files because they had no captions to fetch.
+def body_text_for_indexing(md_path) -> str:
+    """Return the best-available text for vector indexing.
+
+    Order:
+      1. Transcript sidecar (authoritative, was-is said).
+      2. Markdown body "## 1. Summary" + "## 2. Key Takeaways" sections.
+
+    Returns "" if neither yields usable text (~50 chars heuristic)."""
+    import re as _re
+    p = Path(md_path)
+    tpath = p.with_suffix("")  # <slug>.md → <slug>.transcript.txt
+    tpath = tpath.parent / (p.stem + ".transcript.txt")
+    if tpath.exists():
+        return tpath.read_text(encoding="utf-8", errors="replace")
+    text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+    if not text:
+        return ""
+    parts = []
+    m1 = _re.search(r"##\s*1\.\s*Summary\s*\n(.*?)(?=\n##\s|\Z)", text, _re.S)
+    if m1: parts.append(m1.group(1).strip())
+    m2 = _re.search(r"##\s*2\.\s*Key Takeaways\s*\n(.*?)(?=\n##\s|\Z)",
+                    text, _re.S)
+    if m2: parts.append(m2.group(1).strip())
+    return "\n\n".join(parts)
+
+
 def search(conn: sqlite3.Connection, query: str, k: int = 10) -> list[dict]:
     """Top-k nearest chunks by cosine (sqlite-vec normalizes inputs; we normalize
     embeddings at write-time so the default L2 distance becomes equivalent to
