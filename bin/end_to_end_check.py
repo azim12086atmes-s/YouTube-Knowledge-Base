@@ -252,6 +252,51 @@ ok = bool(_pkgs) and all(_md.version(n) == v for n, v in _pkgs)
 check("D21: requirements.txt pins match dev venv", ok,
       f"{[(n, _md.version(n), v) for n, v in _pkgs]}")
 
+# 7j. Web UI: routes present + healthz + index.html + a non-LLM endpoint.
+# ponytail: TestClient from FastAPI is the official "no live port" probe.
+# Skip the live-LLM /api/query probe to avoid burning free-tier quota in CI.
+sys.path.insert(0, str(BIN))
+try:
+    from fastapi.testclient import TestClient
+    import web as _web
+    tc = TestClient(_web.app)
+
+    r = tc.get("/healthz")
+    check("web: /healthz returns 200 ok",
+          r.status_code == 200 and r.json().get("status") == "ok",
+          f"code={r.status_code}")
+
+    r = tc.get("/")
+    check("web: / returns the chat UI HTML",
+          r.status_code == 200 and "video-pipeline chat" in r.text,
+          f"code={r.status_code} bytes={len(r.text)}")
+
+    # Non-LLM routes that don't cost a Gemini call.
+    r = tc.get("/api/sessions")
+    check("web: /api/sessions lists chat sessions",
+          r.status_code == 200 and "sessions" in r.json(),
+          f"code={r.status_code}")
+
+    r = tc.delete("/api/sessions/_e2e_webtest")
+    check("web: /api/sessions/{id} DELETE is idempotent",
+          r.status_code == 200 and "cleared_messages" in r.json(),
+          f"code={r.status_code}")
+
+    r = tc.post("/api/sessions/_e2e_webtest/tag",
+                json={"tag": "ai-tooling"})
+    check("web: /api/sessions/{id}/tag sets active tag",
+          r.status_code == 200 and r.json().get("slugs", 0) >= 1,
+          f"code={r.status_code}")
+
+    r = tc.post("/api/sessions/_e2e_webtest/tag",
+                json={"tag": "this-tag-does-not-exist"})
+    check("web: /tag refuses unknown tag (400)",
+          r.status_code == 400,
+          f"code={r.status_code}")
+except Exception as e:
+    check("web: TestClient import + probes", False,
+          f"{type(e).__name__}: {e}")
+
 # 7h. D20: backfill_watched_at script surface + --watched-at CLI on analyze.
 import re as _re
 n_unknown_after = sum(

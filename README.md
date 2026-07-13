@@ -146,6 +146,29 @@ python bin/chat.py                      # default session
 python bin/chat.py --session mychat    # named session
 ```
 
+### Web UI (FastAPI)
+
+```bash
+pip install -r requirements.txt   # brings in fastapi + uvicorn
+python bin/web.py --port 8080
+# then open http://localhost:8080
+```
+
+ponytail: zero new logic — every endpoint is a thin HTTP wrapper over
+`bin/chat.py` and `bin/vector_store.py`. The HTML is one inline file in
+`web.py` with vanilla JS, no build step. Tag filter is per-request
+(not per-session like the REPL — REST model). Routes:
+
+| method | path | purpose |
+|---|---|---|
+| GET    | `/` | the chat UI (single inline index.html) |
+| POST   | `/api/query` | `{question, session_id?, k?, tag?}` → RAG answer + retrieved chunks |
+| GET    | `/api/sessions` | list sessions |
+| GET    | `/api/sessions/{id}` | history + active tag |
+| DELETE | `/api/sessions/{id}` | clear history + tag |
+| POST   | `/api/sessions/{id}/tag` | `{tag}` → set or clear (null = clear) |
+| GET    | `/healthz` | liveness |
+
 Each turn: vector-search the corpus, prepend top-k excerpts to the
 prompt, then call Gemini with the last 8 messages of conversation
 history (4 user+model pairs). History is persisted in the same SQLite
