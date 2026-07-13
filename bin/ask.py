@@ -168,6 +168,8 @@ def main() -> int:
                 try:
                     conn.close()
                 except Exception:
+                    # ponytail: connection may already be closed by an earlier
+                    # error path; silencing avoids masking the real error.
                     pass
 
     if not transcripts:

@@ -199,6 +199,8 @@ def repl(idx_path: Path, session_id: str, k: int) -> int:
         import sqlite_vec
         sqlite_vec.load(conn)
     except Exception:
+        # ponytail: if sqlite-vec extension is unavailable we fall through
+        # without vector search; ask.py's bundle-and-ask fallback handles it.
         pass
 
     from vector_store import (load_messages, save_message, clear_session,
