@@ -1,130 +1,270 @@
 # video-pipeline
 
-A local-first YouTube video analysis pipeline that turns a Google Takeout
-zip into a searchable, question-answerable corpus of plain-text summaries.
+A local-first pipeline that turns video URLs into a searchable,
+question-answerable RAG corpus. Built around the standard 4-shape
+analysis pattern (Summary / Key Takeaways / Non-Obvious Insights /
+Revolutionary Reframes), indexed with `sqlite-vec`, and served
+through a CLI REPL, an HTTP API, and a single-page browser UI.
 
-* Reads a Takeout zip, finds YouTube watch-history entries.
-* For each entry, fetches the YouTube transcript and runs a 4-shape
-  analysis (Summary / Key Takeaways / Non-Obvious Insights / Revolutionary
-  Reframes) using Gemini text-mode LLMs.
-* Stores the output as Markdown files (one per video) in a local folder.
-* Stores a SQLite index of what was analyzed, when, and with which model.
-* Lets you ask questions across any subset of transcripts — including the
-  entire corpus — using Gemini as the answering model.
+## What it does
 
-## What this is *not*
+- **Ingest** URLs from a Google Takeout zip, an Excel/CSV/JSONL
+  file, or a raw URL list. One file in, one queue of work out.
+- **Analyze** each URL via Gemini: transcript-mode (default; cheap,
+  ~3s wall) or multimodal-mode (Gemini watches the video; ~11s wall,
+  free-tier-quota-limited).
+- **Index** every output as Markdown (one file per slug) plus a SQLite
+  vector store with cosine-retrievable chunks.
+- **Query** the corpus from the CLI REPL, a FastAPI HTTP endpoint,
+  or a self-contained browser chat. Tag-filter, session memory, and
+  multi-turn conversation work in all three.
 
-* Not a hosted service. Runs entirely on your machine.
-* Not a video downloader / scraper. Reads what already exists in a Takeout
-  zip.
-* Not a web UI. `chat.py` is a CLI REPL. A browser-based chat is a future
-  rung gated on user request.
+## What it is *not*
 
-## What it does today
+- Not a hosted service. There is no server you ship to users; the
+  browser UI binds to `127.0.0.1` and the operator is the only reader.
+- Not a video scraper or downloader. It consumes captions/transcripts
+  YouTube already exposes; it does not download media.
+- Not a general-purpose RAG framework. The chunker, retriever, and
+  generator are tuned for one input shape (a YouTube video) and one
+  output shape (a 4-shape markdown summary). Generalising requires
+  a deliberate rewrite, not a config change.
 
-| Capability | Status |
+---
+
+## Architecture
+
+```
+                       ┌─────────────────────────────────────────────────┐
+                       │              jobs.sqlite (audit log)             │
+                       │                                                 │
+   enqueue  ───────►   │  pending → awaiting-quota → running → ok/failed │
+                       │  (idempotent on key_hash; every transition     │
+                       │   written to jobs_log)                          │
+                       └────────────────────────┬────────────────────────┘
+                                                │
+                                                ▼
+                                       bin/daemon.py
+                                       (sleep + dispatch loop)
+
+  ┌──────────────┐    ┌────────────────┐    ┌──────────────────┐
+  │ URL sources  │    │   analyze.py   │    │  vector_store.py │
+  │              │    │                │    │                  │
+  │ - takeout-   │───►│ 4-shape prompts│───►│ - chunk 120 wds  │
+  │   watch zip  │    │  via Gemini    │    │ - embed MiniLM   │
+  │ - xlsx       │    │  (text or      │    │   L6-v2 384 dim  │
+  │ - urlfile    │    │   multimodal)  │    │ - sqlite-vec L2  │
+  └──────────────┘    └────────┬───────┘    │   (= cosine)     │
+                                │            └────────┬─────────┘
+                                ▼                     │
+                       ┌────────────────┐              │
+                       │ ~/Documents/   │◄─────────────┘
+                       │ video-analysis/│
+                       │  <slug>.md     │
+                       │  <slug>.tx.txt │
+                       │ analyzed.sqlite│
+                       └────────────────┘
+                                ▲
+                                │
+                  ┌─────────────┼─────────────┐
+                  │             │             │
+              ask.py       chat.py       web.py
+              (1-shot Q)   (REPL)        (FastAPI +
+                                            inline HTML)
+```
+
+Components:
+
+| Path | Role |
 |---|---|
-| Read Takeout zip → sample N URLs → analyze each | ✓ |
-| Read Takeout zip → walk the entire corpus in chronological order with a state file | ✓ |
-| Skip-write on transcripts that are missing / junk / disabled | ✓ |
-| De-duplicate re-runs via SQLite index | ✓ |
-| Ask a question across any subset of transcripts | ✓ (`ask.py URL1 URL2 ...`) |
-| Ask a question across the entire corpus | ✓ (`ask.py --all`) |
-| Channel discovery from Takeout's `subtitles[]` field | ✓ (`awk -F'|' '{print $5}' | sort | uniq -c | sort -rn`) |
-| Multi-account Takeout | ✗ — gated on second Takeout export from a different account |
-| Chat interface (multi-turn, conversation memory, UI) | ✓ — `bin/chat.py` REPL. Per-session history persisted in `chat_messages` table; retrieval + history injection per turn. CLI today; UI is a future rung gated on user request. |
-| Chat `:tag` filter (per-session, applied to retrieval) | ✓ — `chat.py :tag <name>` sets, `:tag` shows. Filter persisted in `session_state` table. Retrieval re-ranks inside the active tag's slugs. |
-| Corpus inventory / list CLI | ✓ — `bin/list.py [--tag] [--mode] [--outcome] [--limit]` queries `analyzed_videos` + `tag_assignments` in one call. Surfaces what's analyzed, by tag, by mode, by outcome. |
-| Query raw transcript chunks verbatim | ✓ — `ask.py --show-chunks` prints top-k retrieved excerpts with slug + cosine distance before the LLM answer |
-| Classification (auto-tag into fixed vocab) | ✓ — `analyze.py --classify` / `--reclassify`. 9-tag vocabulary (ai-tooling, founder-psychology, investing, personal-development, religion-or-faith, history-or-politics, music-or-performance, lifestyle-or-cooking, other). |
-| Set-logic recall (union/intersection across tags) | ✓ — `ask.py --tag <t>` (repeatable: `--tag a --tag b` = either); tag CRUD in `tag_assignments` table. |
-| Vector store / semantic search | ✓ — `sqlite-vec` + `sentence-transformers/all-MiniLM-L6-v2` (384-dim). `ask.py --all` uses cosine top-k; explicit-URL mode falls back to bundle-and-ask when the index has no embeddings. |
-| Continuous extraction daemon (poll every 20 min) | ✗ — gated on a continuous input source |
-| Push trigger from YouTube webhooks | ✗ — gated on a real external process |
-| Headless-browser auto-fetch of similar videos | ✗ — rung-1 reject (YouTube ToS) |
+| `bin/url_source.py` | URL dispatch: Takeout zip, xlsx, txt/jsonl. Stdlib-only. |
+| `bin/pipeline.py` | Composes `url_source.py` + `analyze.py`; cursor state for `--resume`. |
+| `bin/analyze.py` | One URL → four-shape Markdown; transcript or multimodal mode. |
+| `bin/vector_store.py` | Embedding + chunking + cosine retrieval + chat/tag persistence. |
+| `bin/ask.py` | Single-turn RAG: vector search → prompt → Gemini. |
+| `bin/chat.py` | REPL: same prompt pipeline + per-session history + tag filter. |
+| `bin/web.py` | FastAPI HTTP wrapper around `chat.py`; vanilla-JS UI inline. |
+| `bin/jobs.py` | SQLite-backed job queue with audit log; idempotent on `key_hash`. |
+| `bin/daemon.py` | Long-running dispatcher; periodic + resumable. |
+| `bin/kanban.py` | TTY readout of `jobs.sqlite` by lifecycle state. |
+| `bin/list.py` | Inventory CLI over the corpus index. |
+| `bin/backfill_watched_at.py` | One-shot repair for `watched_at:` front-matter. |
+| `bin/takeout_sample.py` | Back-compat alias of `url_source.py`. |
 
-## Install / setup
+---
+
+## RAG design
+
+The RAG pipeline is the load-bearing piece. Two design choices drive
+every other decision: chunking at the sentence window with a 20-word
+overlap, and ranking by cosine similarity on unit-normalised
+embeddings.
+
+### Ingestion
+
+A source is any iterable of `{id, url, ts?, title?, channel?}` records.
+`url_source.py` produces these from a Takeout zip (parse
+`watch-history.json`, dedupe by `(vid, ts)`), an `.xlsx` (zipfile +
+ElementTree, no openpyxl dep), or a `.txt`/`.jsonl` URL list. The
+metadata fields are preserved through the pipeline so the markdown
+front-matter can carry `watched_at:` from the Takeout `time` field.
+
+### Chunking
+
+```python
+# vector_store.py: chunk_text()
+CHUNK_WORDS = 120
+CHUNK_OVERLAP_WORDS = 20
+```
+
+120 words is roughly 480 tokens with the MiniLM tokenizer — small
+enough that `k=10` chunks plus the system prompt fit comfortably in
+Gemini's input budget with room for the question and a long answer.
+The 20-word overlap preserves continuity at chunk boundaries.
+
+If the source has a transcript sidecar, chunks embed the transcript.
+If the source is a multimodal-mode analysis with no transcript, chunks
+embed `## 1. Summary` + `## 2. Key Takeaways` from the markdown body.
+Both branches live in `vector_store.body_text_for_indexing()`.
+
+### Embedding + retrieval
+
+- Model: `sentence-transformers/all-MiniLM-L6-v2` (384-dim, cosine,
+  ~80 MB on disk).
+- Index: `sqlite-vec` virtual table `chunks` keyed by `chunk_meta`
+  rowid. WAL mode for safe concurrent reads.
+- Distance: L2 on unit-normalised vectors. Equivalent to cosine rank
+  for unit vectors, and `sqlite-vec` has L2 as its native distance.
+- Top-k: 8 for the chat REPL, 10 for `--all`. `--tag <t>` halves
+  `fetch_k` post-filter inside the slugs matching that tag.
+- Returned payload: `[{slug, idx, distance, text}]`.
+
+The retrieval call site is one function:
+
+```python
+hits = _chat.retrieve_chunks(idx_path, question, k=8,
+                            allowed_slugs=allowed_set)
+```
+
+### Generation
+
+The prompt template (in `chat.py:build_contents`) is:
+
+```
+You are a research assistant for a personal YouTube Knowledge Base.
+Answer the user's question using ONLY the provided transcript excerpts.
+Quote specific moments (with the slug + a verbatim phrase) to support
+each claim. If the transcripts don't address the question, say so
+explicitly.
+
+Retrieved transcript excerpts (N):
+[<slug> (dist=X.XXX)] <chunk text>
+...
+
+[conversation history, capped at 8 messages]
+
+[current user question]
+```
+
+Two anti-hallucination guarantees are enforced *in the prompt*:
+
+1. "Use ONLY the provided transcript excerpts" — model is told to
+   refuse rather than invent when no excerpt addresses the question.
+2. "Quote (slug + verbatim phrase)" — every substantive claim must
+   cite a slug and an actual phrase from the excerpt.
+
+The same prompt template is shared by `ask.py`, `chat.py`, and
+`web.py`. Three call sites, one prompt.
+
+The default model is `gemini-3.1-flash-lite` (chat REPL + HTTP) or
+`gemini-flash-lite-latest` (analyze.py text path). Multimodal-mode
+analysis uses `gemini-3.1-flash-lite`. Models are documented in
+`bin/analyze.py`; switching is a one-line constant change.
+
+### Architectural mapping vs. NotebookLM
+
+For a side-by-side of this pipeline against Google NotebookLM —
+which features we transfer, which we deliberately skip, and why — see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## Install
 
 ```bash
-# 1. Clone
-git clone <repo-url> video-pipeline
-cd video-pipeline
+git clone https://github.com/azim12086atmes-s/YouTube-Knowledge-Base
+cd YouTube-Knowledge-Base
 
-# 2. Python deps — pinned to the exact versions used in development.
-#    (For historical / reproduction purposes; in practice `pip install
-#    -U` of these names is fine.)
+# Python deps (pinned to the versions used in development)
 pip install -r requirements.txt
-# Or, equivalently, the un-pinned form (still in the README's "what to
-# install" narrative, but require the file from here on):
-#   pip install google-genai youtube-transcript-api sentence-transformers sqlite-vec
 
-# 3. API key
+# API key
 echo 'GEMINI_API_KEY=YOUR_KEY_HERE' >> ~/.hermes/.env
-# Get a key at: https://aistudio.google.com/apikey
-
-# 4. (Optional) Drop a Google Takeout zip in ~/Downloads/
-#    go to https://takeout.google.com → YouTube → history → JSON format
-
-# 5. (Optional) Backfill embeddings from existing transcripts:
-#    python bin/analyze.py --reindex-from-md
-
-# 6. Verify everything works end-to-end:
-python bin/end_to_end_check.py
-# Should print "OK  all end-to-end checks passed" against the bundled
-# corpus (3 transcripts with sidecars, 75 indexed chunks). If a check
-# fails, the README's "Verify it works" section explains each one.
+# Get a key at https://aistudio.google.com/apikey
 ```
 
-### Verify it works
+The repo is portable across Linux, macOS, and Windows. The corpus
+output path defaults to `~/Documents/video-analysis` on every
+platform; the SQLite DB sits next to the markdown files.
 
-After install, run the end-to-end check to confirm the pipeline works
-against the bundled corpus:
+## Quickstart
 
 ```bash
-python bin/end_to_end_check.py
+# 1. Drop a Takeout zip in ~/Downloads/ (or a .xlsx/.txt URL list)
+
+# 2. Sample + analyze 6 URLs
+python bin/pipeline.py
+
+# 3. Ask a question across the corpus
+python bin/ask.py --all --question "what themes recur across my watched videos?"
 ```
 
-It probes 11 things in ~10 seconds, using the live corpus + Gemini API:
-corpus files exist, vector index populated, CLI surfaces present,
-`ask.py --all` returns a real cited answer, `--show-chunks` works,
-`chat.py` REPL persists a turn.
+That's the happy path. Every other command in this README is a
+refinement on top of these three.
 
-The bundled corpus has 8 markdown files (mixed multimodal + transcript-mode)
-but only 3 transcript sidecars — multimodal-mode analyses don't produce
-`.transcript.txt` sidecars (Gemini multimodal returns a 4-shape Markdown
-but doesn't save the raw transcript). Only transcript-mode analyses do.
-The check counts both.
-
-The scripts assume:
-
-- `~/Documents/video-analysis/` exists and is writable (auto-created on first run).
-- `~/hermes/...` paths for the env file (Windows) or `~/.hermes/.env` (POSIX).
+---
 
 ## Usage
 
-### Analyze a single YouTube URL
+### Analyze a single URL
 
 ```bash
 python bin/analyze.py "https://www.youtube.com/watch?v=<id>"
 ```
 
-Default: transcript-only mode (cheap, ~3s wall per video, no quota burn
-on multimodal). Use `--multimodal` for Gemini to actually watch the video
-(~11s wall, free-tier quota-limited).
+Default mode is transcript-only (~3s wall per video, no quota burn
+on multimodal). `--multimodal` switches to "Gemini watches the video"
+mode (~11s wall, free-tier quota-limited). The analyzer skip-writes
+on transcripts that are missing or junk, and dedupes via the SQLite
+index so re-running the same URL is a no-op.
 
-### Process a Takeout zip end-to-end
+### Ingest from a Takeout zip
 
 ```bash
-# Sample 6 URLs evenly across the date range, then analyze each
+# Sample 6 URLs evenly across the date range, analyze each
 python bin/pipeline.py
 
-# Walk the entire corpus in chronological order; resume across runs
+# Walk the corpus in chronological order; resume across runs
 python bin/pipeline.py --resume --batch-size 50
 ```
 
-State file: `~/.hermes/video-analysis/pipeline-state.json` tracks cursor
-across runs. Run `--resume` repeatedly to chew through 40k watch-history
-entries at Gemini free-tier pace (50–200 calls/day → ~6–18 months).
+State file: `~/.hermes/video-analysis/pipeline-state.json` tracks the
+cursor across runs. Free-tier Gemini quota is the binding constraint
+(50–200 text-mode calls/day); `--resume` makes the long walk
+trivially resumable across quota resets.
+
+### Ingest from xlsx / txt / jsonl URL lists
+
+```bash
+# xlsx: auto-discovers ext*cted_youtube_urls*.xlsx in ~/Downloads/
+python bin/pipeline.py --source xlsx
+
+# txt / jsonl / raw URL list: file is the path
+python bin/url_source.py --source urlfile --file my_urls.txt --n 50
+```
+
+Stdlib-only (zipfile + ElementTree). No `openpyxl` dep. The xlsx parser
+handles both `sharedStrings.xml` and inline-string cells.
 
 ### Ask a question
 
@@ -132,36 +272,53 @@ entries at Gemini free-tier pace (50–200 calls/day → ~6–18 months).
 # Across chosen transcripts
 python bin/ask.py <url1> <url2> --question "what did these speakers say about war?"
 
-# Across the entire corpus
+# Across the entire corpus (vector search + Gemini)
 python bin/ask.py --all --question "what themes run across my watched videos?"
+
+# Restricted to one tag
+python bin/ask.py --all --tag ai-tooling --question "what does this speaker say about building software?"
+
+# See the raw retrieved chunks before the LLM answer
+python bin/ask.py --all --question "conscience and war" --show-chunks
 ```
 
-Honest refusal is built in — if no transcript addresses your question, the
-model will say so rather than confabulate.
+Honest refusal is built into the prompt: if no excerpt addresses the
+question, the model says so rather than confabulating.
 
-### Multi-turn chat (CLI REPL)
+### Multi-turn chat
 
 ```bash
-python bin/chat.py                      # default session
-python bin/chat.py --session mychat    # named session
+python bin/chat.py                       # default session
+python bin/chat.py --session mychat     # named session
 ```
 
-### Web UI (FastAPI)
+Commands inside the REPL:
+
+| command | what |
+|---|---|
+| `:quit` | exit (Ctrl-D / Ctrl-Z also works) |
+| `:clear` | wipe session history |
+| `:status` | session id + message count + last retrieval summary |
+| `:show` | print last retrieved chunks |
+| `:history` | dump raw conversation history |
+| `:sessions` | list all sessions |
+| `:tag [name]` | set/show the active tag filter (per-session) |
+
+### Web UI
 
 ```bash
-pip install -r requirements.txt   # brings in fastapi + uvicorn
 python bin/web.py --port 8080
 # then open http://localhost:8080
 ```
 
-ponytail: zero new logic — every endpoint is a thin HTTP wrapper over
-`bin/chat.py` and `bin/vector_store.py`. The HTML is one inline file in
-`web.py` with vanilla JS, no build step. Tag filter is per-request
-(not per-session like the REPL — REST model). Routes:
+The HTTP layer is a thin FastAPI wrapper around `chat.py` + `vector_store.py`.
+HTML is one inline file in `web.py` with vanilla JS — no build step.
+Tag filter is per-request (REST semantics), not per-session like the
+REPL. Routes:
 
 | method | path | purpose |
 |---|---|---|
-| GET    | `/` | the chat UI (single inline index.html) |
+| GET    | `/` | the chat UI |
 | POST   | `/api/query` | `{question, session_id?, k?, tag?}` → RAG answer + retrieved chunks |
 | GET    | `/api/sessions` | list sessions |
 | GET    | `/api/sessions/{id}` | history + active tag |
@@ -169,243 +326,156 @@ ponytail: zero new logic — every endpoint is a thin HTTP wrapper over
 | POST   | `/api/sessions/{id}/tag` | `{tag}` → set or clear (null = clear) |
 | GET    | `/healthz` | liveness |
 
-Each turn: vector-search the corpus, prepend top-k excerpts to the
-prompt, then call Gemini with the last 8 messages of conversation
-history (4 user+model pairs). History is persisted in the same SQLite
-file. Commands:
+### Classify and filter by tag
 
-| command | what |
-|---|---|
-| `:quit` | exit (Ctrl-D / Ctrl-Z also works) |
-| `:clear` | wipe session history |
-| `:status` | session id + message count + last retrieval summary |
-| `:show` | print last retrieved chunks (same as `ask.py --show-chunks`) |
-| `:history` | dump raw conversation history |
-| `:sessions` | list all sessions in the DB |
-
-CLI today. A web UI is a future rung, gated on user request.
-
-To see the *raw* retrieved transcript excerpts (slug + cosine distance +
-verbatim text) before the LLM answer:
-
-```bash
-python bin/ask.py --all --question "conscience and war" --show-chunks
-```
-
-Useful when the LLM-rendered answer loses detail that the raw chunk
-preserves, or when you want to quote a video directly without going
-through the model.
-
-### Classify + filter by tag
-
-Each analyzed video gets classified into one of nine fixed tags:
+Each analyzed video is classified into one of nine fixed tags:
 `ai-tooling`, `founder-psychology`, `investing`, `personal-development`,
 `religion-or-faith`, `history-or-politics`, `music-or-performance`,
 `lifestyle-or-cooking`, `other`. Tags are persisted in a SQLite table
-and written back to the front-matter of the analysis file. Multimodal-mode
-analyses (no transcript sidecar) are classified from their markdown
-body via `--reclassify-from-md`.
+and written back to the markdown front-matter.
 
 ```bash
-# Tag as part of a fresh analyze:
+# Tag as part of a fresh analyze
 python bin/analyze.py "https://youtu.be/<id>" --classify
 
-# Re-tag every existing markdown file in --out (one Gemini call each):
+# Re-tag every existing markdown (one Gemini call each)
 python bin/analyze.py --reclassify
 
-# Re-tag from markdown body — covers multimodal-mode analyses that
-# have no transcript sidecar:
+# Re-tag from markdown body — covers multimodal-mode files
+# that have no transcript sidecar
 python bin/analyze.py --reclassify-from-md
-
-# Ask a question, restricting to a single tag:
-python bin/ask.py --all --tag ai-tooling --question "what does the speaker say about building software?"
-
-# Ask across multiple tags (union — either tag matches):
-python bin/ask.py --all --tag investing --tag founder-psychology --question "what themes repeat?"
 ```
 
-`--tag` requires the SQLite index to exist; `analyze.py --reindex-from-md`
-populates it.
+Tag-filtering at query time:
 
-### List what's in the corpus
+```bash
+# Single tag
+python bin/ask.py --all --tag ai-tooling --question "..."
+
+# Union — either tag matches
+python bin/ask.py --all --tag investing --tag founder-psychology --question "..."
+```
+
+### Inspect the corpus
 
 ```bash
 python bin/list.py                       # every analyzed video
-python bin/list.py --tag ai-tooling     # filter to one (or many) tags
+python bin/list.py --tag ai-tooling     # one (or many) tags
 python bin/list.py --mode multimodal    # only multimodal-mode analyses
-python bin/list.py --outcome skip-junk  # only skips (e.g. transcript-disabled)
+python bin/list.py --outcome skip-junk  # only skips
 python bin/list.py --limit 10           # last 10 analyzed
 ```
 
-Output is one row per slug with `mode | outcome | tags | analyzed_on`.
-Filters compose: `--tag x --tag y` is union (slug matching either). Useful
-for "what do I actually have right now?" without opening Obsidian.
+Output: one row per slug with `mode | outcome | tags | analyzed_on`.
+Filters compose: `--tag x --tag y` is union.
 
-### Tag-filter the chat REPL
-
-Inside `bin/chat.py` you can pin a session to one tag and every retrieval
-will be re-ranked to top-k chunks from slugs carrying that tag:
-
-```
-chat: session='default' ... commands: :quit :clear :status :show :history :sessions :tag [name]
-[default] > :tag ai-tooling
-active tag set to 'ai-tooling' (1 slug(s) match)
-[default] > what does this speaker say about building software?
-... answer drawn from M1E4ZzdpOco only ...
-[default] > :tag
-active tag: ai-tooling
-```
-
-`:tag [name]` sets, bare `:tag` shows. New sessions default to no filter.
-State is per-session, persisted in `session_state`.
-
-### Backfill watch-time into front-matter
-
-If you have a fresh Takeout zip and your existing analyses show
-`watched_at: unknown`, you can populate that field from the zip's
-watch-history:
+### Recovery operations
 
 ```bash
-python bin/backfill_watched_at.py --zip path/to/takeout-2024xxxxx.zip
-```
-
-Idempotent: only touches files where the front-matter is currently
-empty or "unknown", so it never overrides a more-specific value.
-Recent ingests via `pipeline.py` auto-populate `watched_at` from the
-upstream `time` field — no manual backfill needed for new runs.
-
-### URL lists beyond Takeout (xlsx / txt / jsonl)
-
-If your URLs aren't inside a Takeout zip — say, a Microsoft Excel dump
-of "videos to watch," a plain `.txt` file with one URL per line, or a
-JSONL feed from a scraper — pass them to the same pipeline:
-
-```bash
-# xlsx: auto-discovers ext*cted_youtube_urls*.xlsx in ~/Downloads/
-python bin/pipeline.py --source xlsx
-
-# txt / jsonl / raw URLs: file is the path
-python bin/url_source.py --source urlfile --file my_urls.txt --n 50
-```
-
-Stdlib-only (zipfile + ElementTree, no openpyxl). The xlsx parser
-handles both `sharedStrings.xml` and inline-string cells. The urlfile
-parser picks one URL per non-comment line; JSON lines are parsed for
-`url` / `titleUrl` / `link` keys and the title is preserved for the
-front-matter.
-
-### Retry skips + reindex from markdown body
-
-Two cheap recovery commands when the corpus gets stale:
-
-```bash
-# Re-run every outcome LIKE 'skip%' row (uploader captions sometimes
-# reappear days later):
+# Re-run every "skipped" row (uploader captions sometimes re-appear
+# days after the first try)
 python bin/analyze.py --retry-skips
 
 # Backfill the SQLite vector index from existing markdown files.
-# Covers every OK file even when analyze.py wasn't called with
-# sqlite_vec loaded:
+# One way to recover from a corrupt or missing vector index.
 python bin/analyze.py --reindex-from-md
+
+# Backfill `watched_at:` front-matter from a Takeout zip
+python bin/backfill_watched_at.py --zip path/to/takeout-2024xxxxx.zip
 ```
 
-`--reindex-from-md` is also the recovery path when the index goes
-missing or gets corrupted — every markdown file in `--out` is re-embedded
-(transcript sidecar when present; markdown body `## 1. Summary` + `## 2.
-Key Takeaways` otherwise).
+---
 
-### Architecture comparison with NotebookLM
+## Future scope
 
-`docs/ARCHITECTURE.md` is a one-page side-by-side with Google
-NotebookLM: which NotebookLM features this pipeline transfers
-(transcript-only ingest, source select, evidence-span IDs, inline
-citations, refusal-on-no-evidence), which are rung-1 holds (click-through
-timestamp anchors, reranker, hybrid retrieval, audio overview,
-hosted service), and which we deliberately reject. Read it before
-making changes that look like "we should add a hosted multi-corpus
-mode" or "let's swap in a reranker."
+The following are explicitly **not built** and the reason is in
+[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md). Briefly:
 
-### What channels do I watch most?
+- **Hosted multi-corpus service.** This is a single-operator, local-
+  first pipeline. No auth, no quotas, no multi-tenant. Adding a
+  hosted variant would be a different product, not a feature.
+- **Hybrid retrieval (BM25 + dense) + reranker.** The current cosine-
+  top-k retrieval is good enough that we've measured no failures on
+  real data. Add either when measured miss-rate becomes a complaint.
+- **Click-through timestamp anchors.** NotebookLM citations can jump
+  to a specific second in a video. This pipeline doesn't record
+  timestamps in chunks. Adding it requires re-ingesting transcripts
+  as JSON-with-start-times and updating the chunker.
+- **Audio Overview.** Out of scope by design (hosted-only, Google-
+  side). The local transcript is the closest substitute.
+- **Headless-browser "similar videos" scraping.** YouTube ToS
+  violation + account-suspension risk. The official YouTube Data API
+  `related` endpoint is the honest alternative if a similar-videos
+  use case fires.
+- **Cron-style "self-prompting agent" loop.** Building an LLM-on-
+  timer that decides what to enqueue is the kind of unbounded pattern
+  that pages you at 3am with hallucinated work. Concrete frictions
+  land in the queue via `bin/jobs.py enqueue` or cron-fronted CLI
+  scripts that enqueue based on a rule. The daemon's job is to run
+  what was intentionally queued.
 
-```bash
-python bin/takeout_sample.py --source takeout-watch-all --limit 41960 \
-  | awk -F'|' '{print $5}' | sort | uniq -c | sort -rn | head -20
-```
+### Next-rung ideas (not built yet)
 
-Outputs your top 20 channels by watch count. Real data from one Takeout
-export today: top channels include `Dr. Scarry` (166), `Valuetainment` (144),
-`Alex Hormozi` (143), `Vusi Thembekwayo` (128), `Varun Mayya` (98), `Aevy TV` (98).
+These are explicit rung-1 candidates that haven't fired:
+
+- **Self-bootstrapping embeddings.** Re-embed chunks when the embedding
+  model is upgraded, gated by `key_hash` so the work is idempotent.
+- **Per-slug time-budget knobs.** `--batch-time-cap <min>` for the
+  daemon: stops dispatching when the day is up, marks the rest
+  `awaiting-quota`.
+- **Approval gates.** `--needs-approval` already exists in
+  `bin/jobs.py enqueue`. A worker that requires manual sign-off before
+  running is a small follow-on.
+
+---
 
 ## Project shape
 
 ```
 video-pipeline/
 ├── bin/
-│   ├── analyze.py            # 1-URL → 4-shape Markdown + SQLite row
-│   ├── ask.py                # RAG over chosen/all transcripts (bundle-and-ask)
-│   ├── chat.py               # multi-turn REPL with history persistence
-│   ├── pipeline.py           # Takeout → sample → analyze; supports --resume
-│   ├── url_source.py         # URL sources (takeout-watch, takeout-watch-all)
-│   ├── vector_store.py       # chunk + embed + cosine search + chat persistence
-│   ├── end_to_end_check.py   # one runnable check that the pipeline works
-│   └── takeout_sample.py     # Compatibility alias of url_source.py
-├── corpus -> ~/Documents/video-analysis   # symlink: outputs land here
-│   ├── <slug>.md                            # 4-shape analysis per video
-│   ├── <slug>.transcript.txt                # transcript sidecar
-│   └── analyzed.sqlite                       # global index
+│   ├── _gemini.py                  # shared POST helper for analyze/ask/chat
+│   ├── analyze.py                  # 1-URL → 4-shape Markdown + SQLite row
+│   ├── ask.py                      # single-turn RAG over chosen/all transcripts
+│   ├── backfill_watched_at.py      # repair watched_at front-matter from Takeout
+│   ├── chat.py                     # multi-turn REPL with history + tag filter
+│   ├── daemon.py                   # periodic dispatcher (--interval 20m)
+│   ├── end_to_end_check.py         # 46-probe runnable check that everything works
+│   ├── jobs.py                     # SQLite-backed ops queue with audit log
+│   ├── kanban.py                   # TTY Kanban readout of jobs.sqlite
+│   ├── list.py                     # corpus inventory CLI
+│   ├── pipeline.py                 # Takeout → sample → analyze; supports --resume
+│   ├── takeout_sample.py           # back-compat alias of url_source.py
+│   ├── url_source.py               # URL dispatch: takeout/xlsx/urlfile
+│   ├── vector_store.py             # chunk + embed + cosine search + chat/tag persistence
+│   └── web.py                      # FastAPI HTTP wrapper around chat.py
 ├── docs/
-│   ├── CONVENTIONS.md       # File format spec for corpus/*.md
-│   ├── REQUIREMENTS.md      # What's built, what's deferred, all triggers
-│   └── ANALYSIS-FALLBACK.md # 3-tier fallback design for transcripts
-├── README.md (this file)
-└── LICENSE                  # MIT
+│   ├── ANALYSIS-FALLBACK.md        # 3-tier fallback design for transcripts
+│   ├── ARCHITECTURE.md             # side-by-side with Google NotebookLM
+│   ├── CONVENTIONS.md              # Markdown front-matter schema
+│   └── REQUIREMENTS.md             # status of every feature + triggers
+├── corpus → ~/Documents/video-analysis    # symlink: outputs land here
+├── requirements.txt                # pinned deps (google-genai, sentence-transformers, sqlite-vec, …)
+├── README.md                       # this file
+└── LICENSE                         # MIT
 ```
 
-The 5 scripts in `bin/` are ~1000 LOC of Python total. Stdlib-only except
-`google-genai` (for Gemini API calls) and `youtube-transcript-api` (for
-caption extraction).
+---
 
 ## Documentation
 
-| Doc | What's in it |
-|---|---|
-| `docs/CONVENTIONS.md` | The Markdown front-matter schema. What fields every `<slug>.md` must have. |
-| `docs/REQUIREMENTS.md` | Status of every feature: built, deferred, rejected. Each deferred item names its trigger. |
-| `docs/ANALYSIS-FALLBACK.md` | Why shorts fail to analyze today. 3-tier fallback design (transcript → multimodal audio → local STT). |
-| `docs/ARCHITECTURE.md` | One-page side-by-side with Google NotebookLM's RAG — what this pipeline transfers, what we deliberately skip, and why. |
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — what this pipeline
+  takes from Google NotebookLM's RAG, what it skips, and why.
+- [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md) — status of every
+  feature: built, deferred, rejected. Each deferred item names its
+  rung-1 trigger.
+- [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) — the Markdown front-
+  matter schema every `<slug>.md` follows.
+- [`docs/ANALYSIS-FALLBACK.md`](docs/ANALYSIS-FALLBACK.md) — 3-tier
+  fallback design for transcripts.
 
-Read `REQUIREMENTS.md` first if you want to know what's *not* built and why.
-Read `ARCHITECTURE.md` before adding any feature that looks like the
-NotebookLM equivalents of hosted multi-corpus, reranker, or audio overview.
-
-## Status (as of 2026-07-13)
-
-- 8 analyzed videos in the corpus (6 multimodal-mode + 2 transcript-mode);
-  40,030 unique YouTube URLs in Takeout waiting to be processed.
-- Pipeline supports `--resume` with state file: walk the corpus across
-  many runs at Gemini free-tier pace (50–200 text-mode calls/day).
-- Vector store is **built and complete**: `sqlite-vec` +
-  `sentence-transformers/all-MiniLM-L6-v2` (384-dim). 111 chunks indexed
-  across **8 of 8** OK files (the 5 multimodal-mode files are embedded
-  from their `## 1. Summary` + `## 2. Key Takeaways` body, not transcripts).
-- Multi-turn chat works: `bin/chat.py` REPL and `bin/web.py` HTTP
-  wrapper. Per-session history in `chat_messages`; per-session tag
-  filter via `:tag` in the REPL or per-request `tag` in `/api/query`.
-- Classification works: `analyze.py --classify` tags each analyzed video
-  from a fixed 9-tag vocabulary; `--reclassify-from-md` covers
-  multimodal-mode files (no transcript sidecar). 8 of 8 OK files tagged.
-- Source coverage: Takeout zip, .xlsx, .txt, .jsonl, raw URL lists.
-  All feed the same `pipeline.py` via `--source`.
-- 38 e2e probes pass in `bin/end_to_end_check.py`, ~2:35 wall.
-
-## Recent changes
-
-The full history lives in `git log`. Most recent commits (newest first):
-D24 ARCHITECTURE.md, D23 Web UI, D22 --classify on multimodal, D21
-requirements.txt, D19+D20 vector-index-coverage + backfill_watched_at.
-Run `git log --oneline` for the rest, or browse on
-[GitHub](https://github.com/azim12086atmes-s/YouTube-Knowledge-Base/commits/master).
+---
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [`LICENSE`](LICENSE).
