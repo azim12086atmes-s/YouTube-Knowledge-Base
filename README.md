@@ -181,6 +181,25 @@ The default model is `gemini-3.1-flash-lite` (chat REPL + HTTP) or
 analysis uses `gemini-3.1-flash-lite`. Models are documented in
 `bin/analyze.py`; switching is a one-line constant change.
 
+### Retrieval modes (vector vs. url-list)
+
+Two retrieval paths share the same generation prompt:
+
+| Mode | When used | Source | Trade-off |
+|---|---|---|---|
+| `vector` | default; no slug list given | top-k cosine-similar chunks from the SQLite-vec index | scales to any corpus size; misses exact-phrase and rare-keyword queries |
+| `url-list` | user explicitly picks slugs (Web UI sidebar, `ask.py <url1> <url2>`, or `/api/query` with `slugs=[…]`) | full transcript text per chosen slug, bundled into the prompt | best when the user knows the relevant sources; degrades when bundle size exceeds LLM context |
+
+**Budget rule.** The url-list path exposes a `per_slug_chars`
+parameter (default 60 000 chars per slug). 6 transcripts × 60 000 chars
+= 360 000 chars ≈ 100 000 tokens, well within Gemini 3.1 Flash's
+1M-token context. When the bundle gets larger, lower the per-slug cap
+or fall back to vector search.
+
+**Honest refusal.** Both modes include the prompt instruction
+"If the transcripts don't address the question, say so explicitly."
+The model is told *not* to invent when no excerpt is on-target.
+
 ### Architectural mapping vs. NotebookLM
 
 For a side-by-side of this pipeline against Google NotebookLM —
@@ -311,15 +330,27 @@ python bin/web.py --port 8080
 # then open http://localhost:8080
 ```
 
-The HTTP layer is a thin FastAPI wrapper around `chat.py` + `vector_store.py`.
-HTML is one inline file in `web.py` with vanilla JS — no build step.
-Tag filter is per-request (REST semantics), not per-session like the
-REPL. Routes:
+The HTTP layer is a thin FastAPI wrapper around `chat.py` + `vector_store.py`
++ `ask.py`. HTML is one inline file in `web.py` with vanilla JS — no
+build step. Tag filter is per-request (REST semantics), not per-session
+like the REPL.
+
+The left sidebar lists every analyzed video with mode / outcome / tags
+and a small "transcript ✓" / "no transcript" indicator. Use it to pick
+the slugs you want to ask about; the next `/api/query` will bundle
+exactly those transcripts into the prompt. With no slugs selected, the
+request falls back to vector search across the whole corpus. The
+"mode: vector" / "mode: url-list" banner in the header tells you which
+path each request took.
+
+Routes:
 
 | method | path | purpose |
 |---|---|---|
-| GET    | `/` | the chat UI |
-| POST   | `/api/query` | `{question, session_id?, k?, tag?}` → RAG answer + retrieved chunks |
+| GET    | `/` | the chat UI (sidebar + log + input) |
+| POST   | `/api/query` | `{question, session_id?, k?, tag?, slugs?, per_slug_chars?}` → RAG answer; `slugs` triggers url-list mode |
+| GET    | `/api/videos` | catalog with mode/tag/outcome filters + `has_transcript` |
+| GET    | `/api/transcripts/{slug}` | preview snippet (default 800 chars) |
 | GET    | `/api/sessions` | list sessions |
 | GET    | `/api/sessions/{id}` | history + active tag |
 | DELETE | `/api/sessions/{id}` | clear history + tag |
