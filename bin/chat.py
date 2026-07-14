@@ -70,12 +70,21 @@ SYSTEM_PROMPT = (
 
 
 def retrieve_chunks(idx_path: Path, question: str, k: int = 8,
-                    allowed_slugs=None) -> list[dict]:
-    """Open the corpus index, run a vector search, return hits.
+                    allowed_slugs=None, mode: str = "hybrid") -> list[dict]:
+    """Open the corpus index, run a retrieval, return hits.
 
     ponytail: when allowed_slugs is provided, filter hits to that set
     AFTER retrieval. fetch_k doubled so post-filter doesn't shrink the
     visible set under k. Used by :tag filter.
+
+    mode ∈ {"dense", "hybrid", "pinpoint"}:
+    - dense    : cosine-only on MiniLM embeddings (legacy default)
+    - hybrid   : RRF-fused dense + FTS5 BM25 (D27, Anthropic 49% lift)
+    - pinpoint : BM25-only on a quoted phrase, top-k exact matches
+
+    ponytail: hybrid is the new recommended default for corpus-wide
+    searches. Dense-only remains for callers that explicitly want it
+    (e.g. e2e tests that probe the original code path).
     """
     if not idx_path.exists():
         return []
@@ -84,12 +93,26 @@ def retrieve_chunks(idx_path: Path, question: str, k: int = 8,
         conn = sqlite3.connect(str(idx_path))
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
-        from vector_store import search as vec_search
+        from vector_store import (
+            search as vec_search,
+            hybrid_search,
+            pinpoint_search,
+        )
+        if mode == "pinpoint":
+            hits = pinpoint_search(conn, question, k=k)
+            conn.close()
+            return hits
+        if mode == "hybrid":
+            hits = hybrid_search(conn, question, k=k,
+                                 allowed_slugs=allowed_slugs)
+            conn.close()
+            return hits
+        # default: dense (legacy)
         fetch_k = k * 2 if allowed_slugs else k
         hits = vec_search(conn, question, k=fetch_k)
-        conn.close()
         if allowed_slugs is not None:
             hits = [h for h in hits if h['slug'] in allowed_slugs][:k]
+        conn.close()
         return hits
     except Exception as e:
         print(f"# retrieve failed ({type(e).__name__}: {e}); "

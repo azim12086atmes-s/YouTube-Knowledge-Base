@@ -366,6 +366,60 @@ except Exception as e:
     check("web: TestClient import + probes", False,
           f"{type(e).__name__}: {e}")
 
+# 7k. D27: hybrid search + FTS5 pinpoint (no LLM cost).
+try:
+    sys.path.insert(0, str(BIN))
+    import vector_store as _vs
+    import sqlite_vec as _vec_mod
+    _conn = sqlite3.connect(str(IDX))
+    _conn.enable_load_extension(True)
+    _vec_mod.load(_conn)
+    _vs.ensure_vec(_conn)
+
+    # hybrid_search signature + a known-good query.
+    _hits = _vs.hybrid_search(_conn, "conscience and war", k=5)
+    check("vector_store: hybrid_search returns top-k with score+distance",
+          len(_hits) > 0
+          and "score" in _hits[0]
+          and "distance" in _hits[0],
+          f"first={_hits[0] if _hits else 'empty'}")
+
+    # FTS5 backfill is non-destructive.
+    _n_pre = _conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    _vs.ensure_vec(_conn)  # idempotent
+    _n_post = _conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+    check("vector_store: FTS5 backfill is idempotent",
+          _n_pre == _n_post,
+          f"pre={_n_pre} post={_n_post}")
+
+    # pinpoint_search hits a known phrase.
+    _p = _vs.pinpoint_search(_conn, "conscience", k=3)
+    check("vector_store: pinpoint_search finds exact-phrase matches",
+          len(_p) > 0 and "wgOOBW3CJIY" in {h["slug"] for h in _p},
+          f"slugs={[h['slug'] for h in _p]}")
+
+    # Web /api/pinpoint surfaces a YouTube URL only when timestamps exist.
+    r = tc.get("/api/pinpoint", params={"phrase": "conscience"})
+    _d = r.json()
+    check("web: /api/pinpoint returns hits",
+          r.status_code == 200
+          and _d.get("n_hits", 0) > 0
+          and _d["hits"][0]["slug"] == "wgOOBW3CJIY",
+          f"n={_d.get('n_hits')}")
+    # All current chunks have NULL timestamps, so youtube_url must be None.
+    _all_null = all(h["youtube_url"] is None for h in _d["hits"])
+    check("web: /api/pinpoint youtube_url is null when no timestamps",
+          _all_null, f"urls={[h['youtube_url'] for h in _d['hits']]}")
+
+    r = tc.get("/api/pinpoint", params={"phrase": ""})
+    check("web: /api/pinpoint rejects empty phrase (400)",
+          r.status_code == 400, f"code={r.status_code}")
+
+    _conn.close()
+except Exception as e:
+    check("D27: vector_store + /api/pinpoint probes",
+          False, f"{type(e).__name__}: {e}")
+
 # 7h. D20: backfill_watched_at script surface + --watched-at CLI on analyze.
 import re as _re
 n_unknown_after = sum(

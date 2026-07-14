@@ -261,6 +261,44 @@ def api_transcript(slug: str, chars: int = 800) -> dict:
     }
 
 
+# ponytail D27: pinpoint keyword search. FTS5 MATCH on a phrase returns
+# exact-match chunks ordered by BM25. Each chunk carries (start_s, end_s)
+# when the corpus was re-ingested with timestamps — null otherwise.
+@app.get("/api/pinpoint")
+def api_pinpoint(phrase: str, limit: int = 20) -> dict:
+    if not phrase.strip():
+        raise HTTPException(400, "empty phrase")
+    conn = _open_idx()
+    try:
+        hits = _vs.pinpoint_search(conn, phrase, k=min(limit, 100))
+        return {
+            "phrase": phrase,
+            "n_hits": len(hits),
+            "hits": [
+                {
+                    "slug": h["slug"],
+                    "idx": h["idx"],
+                    "text": h["text"][:1500],
+                    "start_s": h["start_s"],
+                    "end_s": h["end_s"],
+                    "rank": h["rank"],
+                    "bm25": h["bm25"],
+                    # ponytail: only emit a YouTube timestamp URL when
+                    # both start_s and end_s are present. Otherwise the
+                    # response carries the chunk text but no link.
+                    "youtube_url": (
+                        f"https://youtu.be/{h['slug']}?t={int(h['start_s'])}"
+                        if h["start_s"] is not None and h["end_s"] is not None
+                        else None
+                    ),
+                }
+                for h in hits
+            ],
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/sessions/{session_id}")
 def api_session_history(session_id: str) -> dict:
     conn = _open_idx()
