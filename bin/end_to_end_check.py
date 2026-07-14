@@ -312,6 +312,56 @@ try:
     check("web: /tag refuses unknown tag (400)",
           r.status_code == 400,
           f"code={r.status_code}")
+
+    # ponytail: D26 — picker UI route surface. /api/videos lists the
+    # corpus with mode/tag/outcome filters; /api/transcripts/{slug}
+    # returns the transcript text or 404.
+    r = tc.get("/api/videos")
+    check("web: /api/videos lists corpus with has_transcript",
+          r.status_code == 200
+          and isinstance(r.json().get("videos"), list)
+          and len(r.json()["videos"]) > 0
+          and "has_transcript" in r.json()["videos"][0],
+          f"code={r.status_code}")
+
+    r = tc.get("/api/videos?mode=multimodal&outcome=ok")
+    modes = {v["mode"] for v in r.json().get("videos", [])}
+    check("web: /api/videos filters by mode+outcome",
+          r.status_code == 200 and modes == {"multimodal"},
+          f"modes={modes}")
+
+    r = tc.get("/api/transcripts/M1E4ZzdpOco")
+    check("web: /api/transcripts/{slug} returns preview",
+          r.status_code == 200
+          and r.json().get("slug") == "M1E4ZzdpOco"
+          and "preview" in r.json()
+          and r.json()["total_chars"] > 1000,
+          f"chars={r.json().get('total_chars')}")
+
+    r = tc.get("/api/transcripts/no-such-slug-here")
+    check("web: /api/transcripts/{slug} 404s on missing",
+          r.status_code == 404,
+          f"code={r.status_code}")
+
+    # ponytail: D26 — picker payload shape. With slugs=[..] the API
+    # must answer in url-list mode (no chunks, has slugs_used).
+    # We hit a slug that has NO transcript sidecar to verify the
+    # missing-slugs field surfaces the gap honestly rather than 404-ing.
+    r = tc.post("/api/query", json={
+        "question": "what does this speaker say?",
+        "session_id": "_e2e_picker_probe",
+        "slugs": ["M1E4ZzdpOco"],
+        "per_slug_chars": 2000,
+    })
+    d = r.json()
+    check("web: /api/query with slugs returns mode=url-list",
+          r.status_code == 200
+          and d.get("mode") == "url-list"
+          and "M1E4ZzdpOco" in d.get("slugs_used", []),
+          f"mode={d.get('mode')} slugs={d.get('slugs_used')}")
+
+    # Cleanup the picker probe's session.
+    tc.delete(f"/api/sessions/_e2e_picker_probe")
 except Exception as e:
     check("web: TestClient import + probes", False,
           f"{type(e).__name__}: {e}")
