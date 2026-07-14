@@ -31,6 +31,7 @@ What's NOT in this script (rung-1 avoided):
 from __future__ import annotations
 import argparse
 import base64
+import json
 import os
 import re
 import subprocess
@@ -319,6 +320,167 @@ def fetch_transcript(video_url: str) -> Optional[str]:
         return None
 
 
+# ponytail D28: return the timestamped segments instead of joined text.
+# Used by --ingest-raw so chunks carry (start_s, end_s) for pinpoint search.
+#
+# Implementation note: the youtube-content skill helper returns a
+# JSON envelope (dict with full_text + optional timestamped_text), not
+# the raw segment list. We could shell-out to it and re-parse, but
+# the cleaner path is to call youtube-transcript-api directly from
+# here — that gives us the [{text, start, duration}, ...] shape we
+# need. The skill is for human/CLI use; the analyze.py path is the
+# machine use.
+def fetch_transcript_segments(video_url: str
+                              ) -> Optional[list[tuple[str, float, float]]]:
+    """Direct youtube-transcript-api call. Returns
+    [(text, start_s, end_s), ...] on success, None on failure.
+
+    ponytail: shape mirrors FetchedTranscriptSnippet. end_s = start +
+    duration so chunk boundaries can carry a closed interval.
+    """
+    import re as _re
+    m = _re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", video_url or "")
+    if not m:
+        return None
+    video_id = m.group(1)
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        print("# fetch_transcript_segments: youtube-transcript-api not installed",
+              file=sys.stderr)
+        return None
+    try:
+        result = YouTubeTranscriptApi().fetch(video_id)
+        return [(seg.text, float(seg.start),
+                 float(seg.start) + float(seg.duration))
+                for seg in result]
+    except Exception as e:
+        msg = str(e).lower()
+        if "transcripts are disabled" in msg or "no transcript" in msg:
+            return None
+        # ponytail: any other error (network, region, age-restricted) is
+        # also a "no transcript available" outcome for the user.
+        print(f"# fetch_transcript_segments: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+
+
+# ponytail D28: cheap fast-path that doesn't go through Gemini. Fetches
+# the transcript, embeds it, indexes it. The 4-shape markdown summary
+# is *not* produced. Use this when you have 40k URLs and free-tier
+# Gemini quota is the binding constraint — you can walk the corpus
+# end-to-end in hours instead of 6-18 months.
+def ingest_raw(slug: str, watched_at: str, out_dir: Path,
+               index_conn=None, force: bool = False) -> int:
+    """Fetch the YouTube transcript, embed, index. No Gemini call.
+
+    Returns 0 on success, 1 on skip (insufficient signal or no transcript).
+
+    The 4-shape summary is *not* produced. The slug is still searchable
+    via ask.py / chat.py / web.py because the index gets the chunks.
+    The corpus distinguishes this from a full analysis by setting
+    outcome='ok-raw' (vs. 'ok'); the markdown front-matter tells you
+    which path produced the file.
+    """
+    url = full_url(slug)
+    out_path = out_dir / f"{slug}.md"
+    # ponytail: dedup by index, not by file existence. A previous
+    # --ingest-raw run leaves a .md stub but no real analysis; treat
+    # that as a re-runnable no-op unless --force is set.
+    if index_conn is not None and already_analyzed(index_conn, slug) and not force:
+        print(f"  SKIP {slug}: already indexed (see analyzed.sqlite)",
+              file=sys.stderr)
+        return 0
+
+    print(f"\n=== {slug} (ingest-raw) ===", file=sys.stderr)
+    print(f"  url: {url}", file=sys.stderr)
+
+    segments = fetch_transcript_segments(url)
+    if not segments:
+        print(f"  SKIP {slug}: transcript unavailable or disabled by uploader",
+              file=sys.stderr)
+        if index_conn is not None:
+            record_analyzed(index_conn, slug, url, "transcript",
+                            "skip-no-transcript", out_path)
+        return 1
+
+    # Build the text-only form for the legacy .transcript.txt sidecar
+    # (so ask.py's bundle-and-ask, list.py's has_transcript check, and
+    # the Web UI preview all keep working). The JSON form is the new
+    # sidecar; the legacy sidecar is a downstream artifact.
+    joined = " ".join(t for t, _, _ in segments)
+    (out_dir / f"{slug}.transcript.txt").write_text(joined, encoding="utf-8")
+    # JSON sidecar: one JSON object per line, [{text, start, end}, ...]
+    (out_dir / f"{slug}.transcript.jsonl").write_text(
+        "\n".join(json.dumps({"text": t, "start": s, "end": e},
+                            ensure_ascii=False)
+                  for t, s, e in segments) + "\n",
+        encoding="utf-8",
+    )
+
+    # ponytail: same junk-caption threshold as process_one(). A 75%
+    # music-loop transcript is still junk, no Gemini needed to decide.
+    if not _transcript_has_signal(joined):
+        print(f"  SKIP {slug}: transcript is junk (< 200 chars of speech, "
+              f"or >50% non-speech lines)", file=sys.stderr)
+        if index_conn is not None:
+            record_analyzed(index_conn, slug, url, "transcript",
+                            "skip-junk", out_path)
+        return 1
+
+    if index_conn is not None:
+        try:
+            from vector_store import upsert_chunks_with_timestamps
+            n = upsert_chunks_with_timestamps(
+                index_conn, slug, joined, segments=segments,
+            )
+            print(f"  embed: {n} chunks stored (timestamped, no Gemini call)",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"  embed: skipped ({type(e).__name__}: {e})",
+                  file=sys.stderr)
+
+    # ponytail: a small markdown stub so the slug has SOMETHING in the
+    # corpus folder for Obsidian / back-compat. The 4-shape body is
+    # not produced; consumers must know to look at the .transcript.jsonl
+    # sidecar or the vector index.
+    _write_raw_stub(out_path, slug, url, watched_at, len(segments), len(joined))
+    if index_conn is not None:
+        record_analyzed(index_conn, slug, url, "transcript", "ok-raw", out_path)
+    return 0
+
+
+def _write_raw_stub(out_path: Path, slug: str, url: str, watched_at: str,
+                    n_segments: int, n_chars: int) -> None:
+    """Write a minimal markdown stub so the slug exists in the corpus
+    folder. Front-matter records the ingest-raw path so consumers
+    (chat REPL, Obsidian, web UI) know this is a transcript-only file
+    without a 4-shape summary."""
+    if out_path.exists():
+        return  # never overwrite a real analysis
+    today = time.strftime("%Y-%m-%d")
+    fm = (
+        "---\n"
+        f"youtube_id: {slug}\n"
+        f"url: {url}\n"
+        f"title: \"(see URL)\"\n"
+        f"analyzed_on: {today}\n"
+        f"analyzed_with: ingest-raw (no Gemini call, transcript-only)\n"
+        f"watched_at: {watched_at or 'unknown'}\n"
+        f"duration: unknown\n"
+        "tags: []\n"
+        f"transcript_segments: {n_segments}\n"
+        f"transcript_chars: {n_chars}\n"
+        "---\n\n"
+        f"# {slug}\n\n"
+        "Transcript ingested raw — see `<slug>.transcript.jsonl` for\n"
+        "timestamped segments or `<slug>.transcript.txt` for joined text.\n"
+        "No 4-shape summary was produced; this slug is searchable via the\n"
+        "vector index and FTS5 but has no human-readable analysis body.\n"
+    )
+    out_path.write_text(fm, encoding="utf-8")
+
+
 # ponytail: junk-caption threshold — <200 chars OR >50% non-speech content.
 # Tuned against the dJWFUBAUM0E case (75% [Music] loop) and wgOOBW3CJIY
 # (single-line transcript with trailing [Music] that we still want to analyze).
@@ -569,6 +731,22 @@ def main() -> int:
                         "uploader captions sometimes re-appear days after the "
                         "first try. Idempotent: when an analyze write happens "
                         "the row updates; when no signal surfaces, it stays.")
+    # ponytail D28: --ingest-raw bypasses Gemini entirely. Fetches the
+    # transcript, embeds it, indexes it. Use this for the long walk:
+    # 40k URLs from Takeout at 50-200 Gemini calls/day is 6-18 months;
+    # the same walk via transcript-only ingest is bounded by YouTube's
+    # rate limits (lenient) and a single embed per chunk (local, fast).
+    # The 4-shape markdown summary is NOT produced — corpus becomes
+    # searchable without it, and a subsequent --multimodal pass can
+    # produce a per-slug deep-dive for the videos you actually care about.
+    p.add_argument("--ingest-raw", action="store_true",
+                   help="fetch transcript, embed, index — no Gemini call. "
+                        "Use for the 40k-URL walk; produces a markdown stub "
+                        "but no 4-shape summary.")
+    p.add_argument("--force", action="store_true",
+                   help="with --ingest-raw: re-embed even if the slug is "
+                        "already in the index. Use this after a chunker bug "
+                        "fix or to refresh transcripts that updated on YouTube.")
     args = p.parse_args()
 
     mode = "transcript" if args.transcript else "multimodal"
@@ -735,8 +913,14 @@ def main() -> int:
     try:
         for u in args.urls:
             slug = slug_from_url(u)
-            result = process_one(api_key, slug, args.watched_at, args.out,
-                                 mode, index_conn)
+            # ponytail D28: --ingest-raw takes a separate path with no
+            # Gemini call. The api_key isn't required for this branch.
+            if getattr(args, "ingest_raw", False):
+                result = ingest_raw(slug, args.watched_at, args.out,
+                                     index_conn, force=getattr(args, "force", False))
+            else:
+                result = process_one(api_key, slug, args.watched_at, args.out,
+                                     mode, index_conn)
             if result == 1:
                 skipped += 1
                 continue

@@ -176,48 +176,61 @@ def upsert_chunks_with_timestamps(
     """
     ensure_vec(conn)
     # ponytail: re-embed is idempotent — old rows removed by rowid linkage.
-    old = conn.execute(
-        "SELECT rowid FROM chunk_meta WHERE slug = ?", (slug,)
-    ).fetchall()
-    for (rid,) in old:
-        conn.execute("DELETE FROM chunks WHERE rowid = ?", (rid,))
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rid,))
-    conn.execute("DELETE FROM chunk_meta WHERE slug = ?", (slug,))
-    conn.commit()
+    # D28 hardening: wrap delete + insert in a single transaction so
+    # a partial failure (embedding model OOM, network drop on the
+    # new chunks fetch) doesn't leave orphan rows in `chunks` that
+    # have no chunk_meta rowid match.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        old = conn.execute(
+            "SELECT rowid FROM chunk_meta WHERE slug = ?", (slug,)
+        ).fetchall()
+        for (rid,) in old:
+            conn.execute("DELETE FROM chunks WHERE rowid = ?", (rid,))
+            conn.execute("DELETE FROM chunks_fts WHERE rowid = ?", (rid,))
+        conn.execute("DELETE FROM chunk_meta WHERE slug = ?", (slug,))
 
-    # ponytail: when segments are provided, chunk boundaries are
-    # derived from segment text positions inside the joined transcript,
-    # not from word windows. This way a chunk's start_s/end_s are the
-    # actual seconds-of-video the chunk covers — not approximated.
-    if segments:
-        chunks, starts, ends = _chunk_by_segments(transcript, segments)
-    else:
-        chunks = chunk_text(transcript)
-        starts = [None] * len(chunks)
-        ends = [None] * len(chunks)
-    if not chunks:
-        return 0
-    vectors = embed(chunks)
-    inserted = 0
-    for idx, (text, vec, s_s, e_s) in enumerate(zip(chunks, vectors, starts, ends)):
-        conn.execute("INSERT INTO chunks(embedding) VALUES (?)", [_pack(vec)])
-        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute(
-            "INSERT INTO chunk_meta(rowid, slug, idx, text, start_s, end_s) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (rid, slug, idx, text, s_s, e_s),
-        )
-        # ponytail: FTS5 external-content table; we feed it the rowid
-        # explicitly so it joins against chunk_meta by rowid on search.
-        # The tokenize=porter in the schema is the English stemmer
-        # built into SQLite.
-        conn.execute(
-            "INSERT INTO chunks_fts(rowid, text, slug, idx) VALUES (?, ?, ?, ?)",
-            (rid, text, slug, idx),
-        )
-        inserted += 1
-    conn.commit()
-    return inserted
+        # ponytail: when segments are provided, chunk boundaries are
+        # derived from segment text positions inside the joined transcript,
+        # not from word windows. This way a chunk's start_s/end_s are the
+        # actual seconds-of-video the chunk covers — not approximated.
+        if segments:
+            chunks, starts, ends = _chunk_by_segments(transcript, segments)
+        else:
+            chunks = chunk_text(transcript)
+            starts = [None] * len(chunks)
+            ends = [None] * len(chunks)
+        if not chunks:
+            conn.commit()
+            return 0
+        vectors = embed(chunks)
+        inserted = 0
+        for idx, (text, vec, s_s, e_s) in enumerate(zip(chunks, vectors, starts, ends)):
+            conn.execute("INSERT INTO chunks(embedding) VALUES (?)", [_pack(vec)])
+            rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO chunk_meta(rowid, slug, idx, text, start_s, end_s) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (rid, slug, idx, text, s_s, e_s),
+            )
+            # ponytail: FTS5 external-content table; we feed it the rowid
+            # explicitly so it joins against chunk_meta by rowid on search.
+            # The tokenize=porter in the schema is the English stemmer
+            # built into SQLite.
+            conn.execute(
+                "INSERT INTO chunks_fts(rowid, text, slug, idx) VALUES (?, ?, ?, ?)",
+                (rid, text, slug, idx),
+            )
+            inserted += 1
+        conn.commit()
+        return inserted
+    except Exception:
+        # ponytail: a failed ingest leaves the corpus in a state where
+        # the slug has no chunk_meta row (and no orphan chunks thanks
+        # to BEGIN IMMEDIATE). The next --ingest-raw on this slug is a
+        # clean re-attempt.
+        conn.rollback()
+        raise
 
 
 def _chunk_by_segments(transcript: str,

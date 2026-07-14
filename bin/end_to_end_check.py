@@ -420,6 +420,41 @@ except Exception as e:
     check("D27: vector_store + /api/pinpoint probes",
           False, f"{type(e).__name__}: {e}")
 
+# 7l. D28: --ingest-raw surface (no Gemini call, transcript-only
+# embed + index). dQw4w9WgXcQ was ingested earlier in the session;
+# verify the artifacts are in place. Probes do not re-ingest (that
+# would burn a network call every run); they check the schema on a
+# known row.
+n_raw = sqlite3.connect(str(IDX)).execute(
+    "SELECT COUNT(*) FROM analyzed_videos WHERE outcome='ok-raw'"
+).fetchone()[0]
+check("D28: at least one ingest-raw row exists in the index",
+      n_raw >= 1, f"n={n_raw}")
+
+# --ingest-raw + --force must be in --help
+rc = run([sys.executable, str(BIN / "analyze.py"), "--help"], timeout=15)
+ok = "--ingest-raw" in rc.stdout and "--force" in rc.stdout
+check("D28: analyze.py --help exposes --ingest-raw + --force",
+      ok, f"rc={rc.returncode}")
+
+# Web /api/videos?outcome=ok-raw returns the row
+r = tc.get("/api/videos?outcome=ok-raw")
+ok = (r.status_code == 200
+      and any(v["has_transcript"] for v in r.json().get("videos", [])))
+check("D28: /api/videos?outcome=ok-raw lists raw-ingested videos",
+      ok, f"videos={len(r.json().get('videos', []))}")
+
+# /api/pinpoint returns a youtube_url (not None) for the dQw4w9WgXcQ
+# slug which has timestamps. Search for "strangers" — present in
+# the Rick Astley song.
+r = tc.get("/api/pinpoint", params={"phrase": "strangers"})
+_d = r.json()
+ok = (r.status_code == 200
+      and any(h.get("youtube_url") is not None
+              for h in _d.get("hits", [])))
+check("D28: /api/pinpoint returns a clickable youtube_url for timestamped hits",
+      ok, f"hits={_d.get('n_hits')} urls={[h.get('youtube_url') for h in _d.get('hits',[])][:2]}")
+
 # 7h. D20: backfill_watched_at script surface + --watched-at CLI on analyze.
 import re as _re
 n_unknown_after = sum(
