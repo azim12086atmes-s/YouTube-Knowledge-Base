@@ -35,43 +35,50 @@ through a CLI REPL, an HTTP API, and a single-page browser UI.
 ## Architecture
 
 ```
-                       ┌─────────────────────────────────────────────────┐
-                       │              jobs.sqlite (audit log)             │
-                       │                                                 │
-   enqueue  ───────►   │  pending → awaiting-quota → running → ok/failed │
-                       │  (idempotent on key_hash; every transition     │
-                       │   written to jobs_log)                          │
-                       └────────────────────────┬────────────────────────┘
-                                                │
-                                                ▼
-                                       bin/daemon.py
-                                       (sleep + dispatch loop)
-
-  ┌──────────────┐    ┌────────────────┐    ┌──────────────────┐
-  │ URL sources  │    │   analyze.py   │    │  vector_store.py │
-  │              │    │                │    │                  │
-  │ - takeout-   │───►│ 4-shape prompts│───►│ - chunk 120 wds  │
-  │   watch zip  │    │  via Gemini    │    │ - embed MiniLM   │
-  │ - xlsx       │    │  (text or      │    │   L6-v2 384 dim  │
-  │ - urlfile    │    │   multimodal)  │    │ - sqlite-vec L2  │
-  └──────────────┘    └────────┬───────┘    │   (= cosine)     │
-                                │            └────────┬─────────┘
-                                ▼                     │
-                       ┌────────────────┐              │
-                       │ ~/Documents/   │◄─────────────┘
-                       │ video-analysis/│
-                       │  <slug>.md     │
-                       │  <slug>.tx.txt │
-                       │ analyzed.sqlite│
-                       └────────────────┘
-                                ▲
-                                │
-                  ┌─────────────┼─────────────┐
-                  │             │             │
-              ask.py       chat.py       web.py
-              (1-shot Q)   (REPL)        (FastAPI +
-                                            inline HTML)
+   enqueue (jobs.py)
+        │
+        ▼
+   jobs.sqlite ──► bin/daemon.py ──► bin/analyze.py
+   (audit log)      (sleep loop)         │
+                                         ├─── --multimodal ──► Gemini (video frames)
+                                         │                          │
+                                         │                          ▼
+                                         ├─── --transcript ──► Gemini (4 prompts)
+                                         │                          │
+                                         │                          ▼
+                                         │            ┌──────────────────────┐
+                                         │            │  <slug>.md (4-shape) │
+                                         │            │  <slug>.tx.txt       │
+                                         │            │  analyzed.sqlite     │
+                                         │            └──────────┬───────────┘
+                                         │                       │
+                                         │            vector_store.upsert_chunks
+                                         │              (chunks / chunks_fts)
+                                         │
+                                         └─── --ingest-raw ─► youtube-transcript-api
+                                                                │ (no Gemini call)
+                                                                ▼
+                                                   <slug>.md (stub) +
+                                                   <slug>.transcript.jsonl
+                                                   (timestamped, BM25-indexed)
+                                                                │
+                                                                ▼
+                                                        chunks with start_s/end_s
+                                                        → /api/pinpoint click-to-second
 ```
+
+The two paths converge at `vector_store.upsert_chunks[_with_timestamps]`:
+both produce rows in `chunk_meta` + `chunks` (vec0) + `chunks_fts` (FTS5)
++ an `analyzed_videos` row. The corpus is *one* index regardless of
+which path produced the row; the `outcome` column tells them apart
+(`ok` for the 4-shape path, `ok-raw` for `--ingest-raw`).
+
+The single retrieval function `chat.retrieve_chunks(...)` decides at
+query time: `mode='hybrid'` (default, RRF of dense + BM25),
+`mode='dense'` (legacy), or `mode='pinpoint'` (BM25-only on a phrase).
+Generation (`ask.py` / `chat.py` / `web.py` `/api/query`) is a single
+prompt shared by all three call sites; only the retrieval-feeding
+step differs.
 
 Components:
 
@@ -137,14 +144,56 @@ Both branches live in `vector_store.body_text_for_indexing()`.
   for unit vectors, and `sqlite-vec` has L2 as its native distance.
 - Top-k: 8 for the chat REPL, 10 for `--all`. `--tag <t>` halves
   `fetch_k` post-filter inside the slugs matching that tag.
-- Returned payload: `[{slug, idx, distance, text}]`.
+- Returned payload: `[{slug, idx, distance, text, start_s, end_s, score}]`.
 
-The retrieval call site is one function:
+**Hybrid dense + BM25** (D27, the default since 2026-07-14): the
+retriever runs both a dense top-k (`chunks` vec0 by L2) and a BM25
+top-k (`chunks_fts` FTS5) and fuses them with Reciprocal Rank Fusion
+(Cormack et al. 2009, k=60). The two lists overlap on the corpus
+anchor chunks but diverge on:
+
+- **Dense wins on paraphrase** — "fix memory leak" matches
+  "diagnose RAM consumption" because the embedding geometry is
+  smoothed.
+- **BM25 wins on identifier lookup** — proper nouns, model numbers,
+  error codes, YouTube slugs. The exact-token match is what you want
+  here, and dense averaging eats it.
+
+Why RRF: it doesn't require learning weights, it doesn't assume the
+two scorings are calibrated, and it converges on the chunks that
+*both* lists agree are relevant. Anthropic's contextual-retrieval
+benchmarks (Sep 2024) report a 49% retrieval-failure reduction from
+the dense+BM25 pair alone (without reranker) versus 35% from
+contextual embeddings alone.
+
+**Schema:**
+
+```
+chunk_meta (rowid, slug, idx, text, start_s REAL, end_s REAL)
+chunks      (vec0 virtual — embedding float[384])
+chunks_fts  (FTS5 virtual — text, slug UNINDEXED, idx UNINDEXED,
+             tokenize='porter unicode61 remove_diacritics 2')
+```
+
+`ensure_vec()` is idempotent: it adds the new columns via
+`ALTER TABLE … ADD COLUMN` (swallowing `duplicate column name`),
+creates the FTS5 table on first call, and backfills it from
+`chunk_meta` if any chunks pre-date the FTS5 index. After the first
+call, every `upsert_chunks` writes to all three tables in one
+transaction so a partial failure can't leave orphans.
+
+The retrieval call site is one function with a `mode` parameter:
 
 ```python
+# chat.retrieve_chunks(idx_path, question, k=8,
+#                      allowed_slugs=set, mode='hybrid'|'dense'|'pinpoint')
 hits = _chat.retrieve_chunks(idx_path, question, k=8,
                             allowed_slugs=allowed_set)
 ```
+
+`mode='hybrid'` is the default (D27+). `mode='dense'` is the legacy
+path kept for back-compat. `mode='pinpoint'` is BM25-only on an
+exact phrase — used by `/api/pinpoint` for the click-to-second UX.
 
 ### Generation
 
@@ -257,6 +306,34 @@ mode (~11s wall, free-tier quota-limited). The analyzer skip-writes
 on transcripts that are missing or junk, and dedupes via the SQLite
 index so re-running the same URL is a no-op.
 
+### Ingest raw transcripts (no Gemini call)
+
+```bash
+python bin/analyze.py "https://www.youtube.com/watch?v=<id>" --ingest-raw
+# or for the long Takeout walk:
+python bin/pipeline.py --source takeout-watch --batch-size 50
+```
+
+`--ingest-raw` is the **fast path**. It fetches the YouTube transcript
+directly, embeds it locally with `sentence-transformers`, and writes
+to the vector index. **No Gemini call is made.** The 4-shape markdown
+summary is *not* produced — the slug is searchable through the index
+and FTS5 immediately, but has no human-readable analysis body. A
+subsequent `--multimodal` pass on the same slug can add a deep-dive
+summary for videos you actually want to study.
+
+The 40k-URL Takeout walk: at free-tier quota (50–200 Gemini calls
+/day) the 4-shape path is 6–18 months. The `--ingest-raw` path is
+bounded only by YouTube's caption-fetch rate limit (~200 req/min)
+and local embedding compute (~1s per chunk on CPU). Hours, not
+months.
+
+Each raw-ingested slug also writes a `.transcript.jsonl` sidecar
+(`{text, start, end}` per line) so chunks carry real YouTube
+timestamps and `/api/pinpoint` returns click-to-second YouTube URLs.
+`--force` re-embeds an already-indexed slug (use this after a
+chunker fix or to refresh transcripts that updated on YouTube).
+
 ### Ingest from a Takeout zip
 
 ```bash
@@ -304,6 +381,36 @@ python bin/ask.py --all --question "conscience and war" --show-chunks
 Honest refusal is built into the prompt: if no excerpt addresses the
 question, the model says so rather than confabulating.
 
+### Pinpoint search (find the second where X said Y)
+
+```bash
+# CLI: not yet; the Web UI is the primary surface.
+# API:
+curl "http://localhost:8080/api/pinpoint?phrase=conscience"
+# → {"hits": [{"slug": "wgOOBW3CJIY", "start_s": 1.36, "end_s": 47.16,
+#              "youtube_url": "https://youtu.be/wgOOBW3CJIY?t=1", ...}]}
+```
+
+Pinpoint is **BM25-only on an exact phrase** (mode='pinpoint'). It
+returns every chunk containing that phrase, ordered by BM25, with
+the real YouTube `start_s`/`end_s` for each hit. Each hit's
+`youtube_url` is a click-through link to `?t=<start_s>` so the
+browser jumps to the second of the video where the speaker said
+the phrase.
+
+This is the dense-retrieval-failure antidote: when the user knows
+the exact phrase ("the model TS-999", "YH4zaMAnGWs", "dQw4w9WgXcQ"),
+BM25 catches it instantly. The dense path's strength is paraphrase
+("fix memory leak" → "diagnose RAM consumption"), but it loses
+exact-token matches. Pinpoint is the tool for those.
+
+Pinpoint requires timestamps (`start_s`/`end_s` not NULL) on the
+chunks. Today's corpus has 13 timestamped chunks from a single
+`--ingest-raw` slug; the other 111 chunks pre-date the timestamp
+schema and surface in pinpoint results *without* a clickable URL
+(their `youtube_url` is `null`). Re-ingest any slug with
+`--ingest-raw --force` to add timestamps without re-prompting Gemini.
+
 ### Multi-turn chat
 
 ```bash
@@ -347,10 +454,11 @@ Routes:
 
 | method | path | purpose |
 |---|---|---|
-| GET    | `/` | the chat UI (sidebar + log + input) |
+| GET    | `/` | the chat UI (sidebar + log + input + pinpoint bar) |
 | POST   | `/api/query` | `{question, session_id?, k?, tag?, slugs?, per_slug_chars?}` → RAG answer; `slugs` triggers url-list mode |
 | GET    | `/api/videos` | catalog with mode/tag/outcome filters + `has_transcript` |
 | GET    | `/api/transcripts/{slug}` | preview snippet (default 800 chars) |
+| GET    | `/api/pinpoint?phrase=…` | BM25 exact-phrase search; each hit carries `start_s`/`end_s` and a `youtube_url` for click-to-second jump |
 | GET    | `/api/sessions` | list sessions |
 | GET    | `/api/sessions/{id}` | history + active tag |
 | DELETE | `/api/sessions/{id}` | clear history + tag |
@@ -400,6 +508,34 @@ python bin/list.py --limit 10           # last 10 analyzed
 Output: one row per slug with `mode | outcome | tags | analyzed_on`.
 Filters compose: `--tag x --tag y` is union.
 
+### Job queue, daemon, and Kanban
+
+For unattended operation across hundreds of URLs, the pipeline has
+three pieces:
+
+| Script | Role |
+|---|---|
+| `bin/jobs.py` | SQLite-backed job queue: `init`, `enqueue`, `list`, `show`, `dispatch`. Every state transition is recorded in an audit log (`jobs_log`). Idempotent re-enqueues are keyed by `key_hash`. |
+| `bin/daemon.py` | Long-running dispatcher. Polls the queue every N minutes (default 20m), runs pending+awaiting-quota jobs, exits on `--once` or `--limit` exhaustion. Stale `running` rows are reclaimed on startup. |
+| `bin/kanban.py` | TTY Kanban of every job in the queue. Columns by state: `pending`, `pending-approval`, `awaiting-quota`, `running`, `ok`, `skipped`, `failed`. `--watch --interval 5s` for live tail. |
+
+```bash
+# One-shot: enqueue a batch + dispatch immediately
+python bin/jobs.py enqueue analyze url1 url2 url3
+python bin/jobs.py dispatch --limit 3
+
+# Long-running: drain the queue every 20 minutes
+python bin/jobs.py daemon --interval 20m
+
+# Watch the queue
+python bin/kanban.py --watch --interval 5s
+```
+
+The daemon doesn't *decide* what to enqueue — it runs what was
+intentionally queued. Concrete frictions land in the queue via
+`bin/jobs.py enqueue` or via a cron-fronted CLI that enqueues
+based on a rule. See **Future scope** for the rationale.
+
 ### Recovery operations
 
 ```bash
@@ -425,13 +561,13 @@ The following are explicitly **not built** and the reason is in
 - **Hosted multi-corpus service.** This is a single-operator, local-
   first pipeline. No auth, no quotas, no multi-tenant. Adding a
   hosted variant would be a different product, not a feature.
-- **Hybrid retrieval (BM25 + dense) + reranker.** The current cosine-
-  top-k retrieval is good enough that we've measured no failures on
-  real data. Add either when measured miss-rate becomes a complaint.
-- **Click-through timestamp anchors.** NotebookLM citations can jump
-  to a specific second in a video. This pipeline doesn't record
-  timestamps in chunks. Adding it requires re-ingesting transcripts
-  as JSON-with-start-times and updating the chunker.
+- **Reranker (Cohere Rerank 3 / BGE-reranker-v2-m3).** The hybrid
+  dense+BM25 retrieval is the 49% lift from Anthropic's contextual-
+  retrieval benchmarks; a reranker would push it to 67%. Held until
+  measured miss-rate on real queries becomes a complaint.
+- **Contextual embeddings (Anthropic's 35% lift).** Adds a per-chunk
+  LLM call at index time. Cheap at 75 chunks, expensive at 10k+.
+  Held.
 - **Audio Overview.** Out of scope by design (hosted-only, Google-
   side). The local transcript is the closest substitute.
 - **Headless-browser "similar videos" scraping.** YouTube ToS
@@ -444,6 +580,12 @@ The following are explicitly **not built** and the reason is in
   land in the queue via `bin/jobs.py enqueue` or cron-fronted CLI
   scripts that enqueue based on a rule. The daemon's job is to run
   what was intentionally queued.
+
+> **Note** Items that *were* in earlier drafts of this section have
+> shipped since: hybrid dense+BM25 retrieval (D27, 2026-07-14),
+> click-through timestamp anchors via `/api/pinpoint` (D27), and
+> the transcript-only ingest path `--ingest-raw` (D28). See the
+> **RAG design** section above for the current architecture.
 
 ### Next-rung ideas (not built yet)
 
