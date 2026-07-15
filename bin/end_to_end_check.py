@@ -564,6 +564,39 @@ rc = run([sys.executable, str(BIN / "kanban.py"), "--state", "ok"], timeout=10)
 ok = rc.returncode == 0 and ("ok (" in rc.stdout or "no rows" in rc.stdout)
 check("kanban.py --state ok renders without error", ok, f"rc={rc.returncode}")
 
+# 11. D29: agent_loop reads REQUIREMENTS.md, surfaces unshipped D# rows.
+# The loop is the "do it yourself" cadence the user asked for: a
+# self-call that lists what triggers are open, then exits so the
+# agent on top of the loop can pick. Probe verifies: --help works,
+# --once runs and surfaces a sane number of unshipped rows. The
+# agent_loop's own e2e run is *not* tested in this probe (it would
+# double the e2e_check.py wall time). The e2e at probe time is the
+# one this very script is running.
+rc = run([sys.executable, str(BIN / "agent_loop.py"), "--help"], timeout=10)
+check("agent_loop.py --help surfaces --once + --watch",
+      "--once" in rc.stdout and "--watch" in rc.stdout,
+      f"rc={rc.returncode}")
+
+# Use a custom env that disables the e2e run inside agent_loop.
+# ponytail: we monkey-patch by setting AGENT_LOOP_SKIP_E2E=1.
+import os as _os_loop
+_env_loop = {**_os_loop.environ, "AGENT_LOOP_SKIP_E2E": "1"}
+rc = subprocess.run(
+    [sys.executable, str(BIN / "agent_loop.py")],
+    capture_output=True, text=True, timeout=30, env=_env_loop,
+)
+combined = (rc.stdout or "") + "\n" + (rc.stderr or "")
+# The current state has 8 truly-unshipped D#s (D1, D2, D5-D9,
+# D18). We don't pin the count — adding a new D# shouldn't break
+# this probe — but we do require that the count is bounded (e.g.
+# not 0 and not 50) and the output is non-empty.
+import re as _re_loop
+m = _re_loop.search(r"agent_loop:\s+(\d+)\s+unshipped D#", combined)
+n_unshipped = int(m.group(1)) if m else 0
+check("agent_loop: --once surfaces a sane number of unshipped rows",
+      rc.returncode == 0 and 0 < n_unshipped < 50,
+      f"n_unshipped={n_unshipped} rc={rc.returncode}")
+
 # Summary.
 print()
 if failures:

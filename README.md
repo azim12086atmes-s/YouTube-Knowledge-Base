@@ -96,6 +96,7 @@ Components:
 | `bin/kanban.py` | TTY readout of `jobs.sqlite` by lifecycle state. |
 | `bin/list.py` | Inventory CLI over the corpus index. |
 | `bin/backfill_watched_at.py` | One-shot repair for `watched_at:` front-matter. |
+| `bin/agent_loop.py` | "Do it yourself" cadence: surface unshipped D# rows + e2e status. Designed for cron-registered self-calls. |
 | `bin/takeout_sample.py` | Back-compat alias of `url_source.py`. |
 
 ---
@@ -536,6 +537,50 @@ intentionally queued. Concrete frictions land in the queue via
 `bin/jobs.py enqueue` or via a cron-fronted CLI that enqueues
 based on a rule. See **Future scope** for the rationale.
 
+### Agent loop (the "do it yourself" cadence)
+
+```bash
+# One tick: surface unshipped D# rows + run e2e gate
+python bin/agent_loop.py
+
+# Long-running: every 20 minutes, run one tick
+python bin/agent_loop.py --watch --interval 20m
+
+# Register on Windows Task Scheduler (one-liner, see below)
+schtasks /Create /SC MINUTE /MO 20 /TN "video-pipeline-agent" \
+  /TR "C:\Users\karee\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe C:\Users\karee\projects\video-pipeline\bin\agent_loop.py"
+```
+
+`bin/agent_loop.py` is the disciplined self-call that addresses
+the *real* bottleneck the user named: "I can't keep telling the
+whole requirements again and again — you have to probe and build
+yourself rather than me telling you all the time."
+
+The loop:
+
+1. Reads `docs/REQUIREMENTS.md`.
+2. Surfaces every unshipped D# row with its trigger sentence.
+3. Runs the e2e gate; reports pass/fail counts.
+4. Exits.
+
+The loop is *not* a free-form LLM. It does not invent rungs. It
+does not call Gemini. It only surfaces the unshipped set + e2e
+status. The agent that runs on top of the loop (when you wrap it
+with `hermes --yolo --script bin/agent_loop.py`, or just by
+running `python bin/agent_loop.py` from a Claude/Cursor/etc.
+session) is the one that picks the rung. The script is the
+disciplined substrate; the agent is the decision-maker.
+
+This is intentional. An LLM-on-timer that decides what to enqueue
+unprompted is the kind of unbounded pattern that pages you at 3am
+with hallucinated work. The agent-loop substrate enforces the
+same posture the user wanted from the daemon: "run what was
+intentionally queued," where "intentionally queued" means a
+trigger has fired for a named D#.
+
+`AGENT_LOOP_SKIP_E2E=1` skips the e2e run inside the loop (useful
+for cron invocations that already know the e2e is green).
+
 ### Recovery operations
 
 ```bash
@@ -608,6 +653,7 @@ These are explicit rung-1 candidates that haven't fired:
 video-pipeline/
 ├── bin/
 │   ├── _gemini.py                  # shared POST helper for analyze/ask/chat
+│   ├── agent_loop.py               # "do it yourself" cadence: surface unshipped D#s
 │   ├── analyze.py                  # 1-URL → 4-shape Markdown + SQLite row
 │   ├── ask.py                      # single-turn RAG over chosen/all transcripts
 │   ├── backfill_watched_at.py      # repair watched_at front-matter from Takeout
