@@ -655,6 +655,40 @@ rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"),
 check("agent_skill_graphify: rebuild_if_stale exits 0 (graph fresh)",
       rc.returncode == 0, f"rc={rc.returncode}")
 
+# 13. D31: DOX — root + bin/ + docs/ AGENTS.md files exist.
+# The DOX discipline requires the next agent to walk the AGENTS.md
+# chain before editing. The e2e can verify the files exist; it
+# cannot verify the agent reads them. (The "read before edit" rule
+# is behavioral — the harness catches "first action was git add
+# without first walking the chain" through reviewer observation.)
+_root_agents = Path(__file__).resolve().parent.parent / "AGENTS.md"
+_bin_agents = Path(__file__).resolve().parent / "AGENTS.md"
+_docs_agents = Path(__file__).resolve().parent.parent / "docs" / "AGENTS.md"
+all_present = (_root_agents.exists()
+               and _bin_agents.exists()
+               and _docs_agents.exists())
+check("DOX: AGENTS.md present at root + bin/ + docs/", all_present,
+      f"root={_root_agents.exists()} bin={_bin_agents.exists()} docs={_docs_agents.exists()}")
+
+# Each file must reference the next: root must list bin/AGENTS.md
+# in its Child DOX Index; bin/ must reference the root.
+_root_text = _root_agents.read_text(encoding="utf-8", errors="replace") if _root_agents.exists() else ""
+_bin_text = _bin_agents.read_text(encoding="utf-8", errors="replace") if _bin_agents.exists() else ""
+_docs_text = _docs_agents.read_text(encoding="utf-8", errors="replace") if _docs_agents.exists() else ""
+check("DOX: root AGENTS.md indexes bin/AGENTS.md in Child DOX Index",
+      "bin/AGENTS.md" in _root_text, f"missing from root")
+check("DOX: bin/AGENTS.md references the root contract",
+      "root" in _bin_text.lower() or "above it" in _root_text.lower(),
+      "no upstream reference in bin/AGENTS.md")
+check("DOX: docs/AGENTS.md references the root contract",
+      "root" in _docs_text.lower() or "above it" in _root_text.lower(),
+      "no upstream reference in docs/AGENTS.md")
+# And the four docs files must be named in docs/AGENTS.md so the
+# child doc is self-aware.
+for doc in ("REQUIREMENTS.md", "CONVENTIONS.md", "ARCHITECTURE.md", "ANALYSIS-FALLBACK.md"):
+    check(f"DOX: docs/AGENTS.md names {doc}",
+          doc in _docs_text, f"missing reference to {doc}")
+
 # Summary.
 print()
 if failures:
