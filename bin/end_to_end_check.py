@@ -689,6 +689,38 @@ for doc in ("REQUIREMENTS.md", "CONVENTIONS.md", "ARCHITECTURE.md", "ANALYSIS-FA
     check(f"DOX: docs/AGENTS.md names {doc}",
           doc in _docs_text, f"missing reference to {doc}")
 
+# 14. D32: ingest_takeout walker — one-shot takeout drain.
+# The user named the pain: "make sure all videos from takeout
+# are analyzed rather than just stopping at a few." This probe
+# verifies the walker exists, has all 3 subcommands, and that
+# `status` runs without error. We do NOT actually drain 40k
+# URLs in CI — that is a user-initiated, hours-long operation
+# that requires a network rate-limit decision.
+rc = run([sys.executable, str(BIN / "ingest_takeout.py"), "--help"],
+         timeout=10)
+check("ingest_takeout.py --help surfaces status + enqueue + walk",
+      rc.returncode == 0
+      and "status" in rc.stdout
+      and "enqueue" in rc.stdout
+      and "walk" in rc.stdout,
+      f"rc={rc.returncode}")
+
+rc = run([sys.executable, str(BIN / "ingest_takeout.py"), "status"],
+         timeout=30)
+ok = (rc.returncode == 0
+      and "takeout files found" in rc.stdout)
+check("ingest_takeout.py: status reports takeout file count + format",
+      ok, f"rc={rc.returncode}")
+
+# The 4-shape CLI must still expose ingest-raw / force / etc.
+rc = run([sys.executable, str(BIN / "analyze.py"), "--help"], timeout=10)
+ok = ("--ingest-raw" in rc.stdout
+      and "--force" in rc.stdout
+      and "--multimodal" in rc.stdout
+      and "--reindex-from-md" in rc.stdout)
+check("D32: analyze.py --help still exposes --ingest-raw + --force + --multimodal + --reindex-from-md",
+      ok, f"rc={rc.returncode}")
+
 # Summary.
 print()
 if failures:

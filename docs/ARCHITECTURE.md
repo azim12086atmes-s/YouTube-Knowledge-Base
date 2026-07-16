@@ -77,3 +77,42 @@ is *not*."
 - Hosted user service. Local-first is the contract.
 
 See `docs/REQUIREMENTS.md` for the full deferred-rungs table.
+
+## Models in use (2026-07-16)
+
+Three models serve distinct roles in the pipeline. The "what model
+are we parsing the transcripts to?" question has a layered answer
+because the transcript is touched by three different models in
+three different phases:
+
+| Phase | Model | Why | Cost / rate limit |
+|---|---|---|---|
+| **Embed (index time)** | `sentence-transformers/all-MiniLM-L6-v2` (384-dim, runs locally) | Encodes a chunk as a vector for cosine search. | Free, no rate limit. ~1-2s per chunk on CPU. |
+| **Embed (search time)** | same MiniLM model | Encodes the user's question to find nearest chunks. | Free, no rate limit. |
+| **Analyze (4-shape summary, transcript-mode)** | `gemini-flash-lite-latest` via `google-genai` SDK | Generates Summary / Key Takeaways / Notable Quotes / Tags from a transcript. | Free tier: 50–200 calls/day. ~3s per video. |
+| **Analyze (4-shape summary, multimodal-mode)** | `gemini-3.1-flash-lite` via `google-genai` SDK | Gemini watches the video frames + transcript. | Free tier: 50–200 calls/day. ~11s per video. |
+| **Answer (chat/ask/web)** | `gemini-3.1-flash-lite` | Generates the final answer from the retrieved chunks + history. | Free tier: same as above. ~1-2s per turn. |
+| **Transcript fetch** | `youtube-transcript-api` (Python) | Pulls the YouTube captions API. | Lenient; ~200 req/min shared fingerprint. |
+| **`--ingest-raw` path** | (no model) | Local transcript + local embed, NO Gemini call. The right path for the 40k-URL Takeout walk. | Free, no rate limit on the analysis side. ~1-2s per video. |
+
+**Ponytail rule:** the embedding model is the only one that runs
+on the user's machine without API-key throttling. Gemini is the
+only one with a daily quota. The `--ingest-raw` path was added
+specifically to bypass Gemini's quota for the corpus-wide walk;
+it produces less per-video output (no 4-shape summary) but the
+corpus becomes searchable in hours instead of months.
+
+**Embedding-model swap is local-only.** `EMBED_MODEL_NAME` in
+`bin/vector_store.py` is the single source of truth. To upgrade
+to a stronger embedder (e.g. `BAAI/bge-base-en-v1.5`), change
+that one constant, delete `analyzed.sqlite`, run
+`bin/agent_loop.py --once` (or `bin/analyze.py --reindex-from-md`
+on each video), and the new model is in place. The reindex cost
+is local CPU time; no API quota is consumed.
+
+**Gemini-model swap is one-line.** `GEMINI_TEXT_MODEL` and
+`GEMINI_MULTI_MODEL` in `bin/analyze.py`. Switching to
+`gemini-2.5-pro` for higher-quality 4-shape summaries is a
+one-line edit; the new model is in place on the next call.
+
+## End
