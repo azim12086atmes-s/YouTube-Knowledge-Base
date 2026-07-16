@@ -6,6 +6,10 @@ google-genai==2.11.0          # Gemini SDK — analyze.py + _gemini.py POSTs
 sentence-transformers==5.6.0  # all-MiniLM-L6-v2 embeddings (384-dim)
 sqlite-vec==0.1.9             # vec0 virtual table for the chunks index
 youtube-transcript-api==1.2.4 # youtube-content skill helper (fetch_transcript)
+graphifyy==0.9.16             # repo-graph skill (bin/agent_skill_graphify.py).
+                              # PyPI name has double-y to dodge a name collision
+                              # with the canonical `graphify` package; resolves
+                              # to the Graphify-Labs/graphify GitHub project.
 
 # Web UI only — required if you `python bin/web.py`. Skip if you only
 # use the CLI REPL.
