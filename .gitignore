@@ -14,3 +14,5 @@ pipeline-state.json
 .vscode/
 .idea/
 *.swp
+graphify-out/
+graphify-out/agent-skill-results.json

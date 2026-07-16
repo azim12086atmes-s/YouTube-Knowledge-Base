@@ -597,6 +597,64 @@ check("agent_loop: --once surfaces a sane number of unshipped rows",
       rc.returncode == 0 and 0 < n_unshipped < 50,
       f"n_unshipped={n_unshipped} rc={rc.returncode}")
 
+# 12. D30: agent_skill_graphify.py — repo-graph wrapper.
+# The user named graphify as the next-rung tool to address context
+# bloat. The wrapper exposes query / path / explain / affected as
+# structured subcommands and saves results to JSON so the next
+# agent can read without re-invoking graphify.
+import json as _json
+rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"), "--help"],
+         timeout=10)
+check("agent_skill_graphify: --help surfaces rebuild + status + query",
+      rc.returncode == 0
+      and "rebuild" in rc.stdout
+      and "status" in rc.stdout
+      and "query" in rc.stdout,
+      f"rc={rc.returncode}")
+
+# status: graph.json should exist (we ran it interactively earlier).
+rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"), "status"],
+         timeout=10)
+ok = (rc.returncode == 0
+      and "nodes:" in rc.stdout
+      and "edges:" in rc.stdout)
+check("agent_skill_graphify: status reports nodes + edges",
+      ok, f"rc={rc.returncode}")
+
+# query: returns a dict with rc=0 + question + output. Saves
+# result to graphify-out/agent-skill-results.json (gitignored).
+rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"),
+          "query", "where is upsert_chunks defined", "--budget", "500"],
+         timeout=60)
+try:
+    data = _json.loads(rc.stdout)
+    q_ok = (data.get("rc") == 0
+            and "upsert_chunks" in data.get("output", "")
+            and "vector_store.py" in data.get("output", ""))
+except Exception as e:
+    q_ok = False
+check("agent_skill_graphify: query returns structured result with upsert_chunks + vector_store.py", q_ok, f"rc={rc.returncode}")
+
+# path: returns a dict with rc=0 + from + to + output.
+rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"),
+          "path", "vector_store.py", "analyze.py", "--budget", "300"],
+         timeout=30)
+try:
+    data = _json.loads(rc.stdout)
+    p_ok = (data.get("rc") == 0
+            and "from" in data and "to" in data
+            and "Shortest path" in data.get("output", ""))
+except Exception:
+    p_ok = False
+check("agent_skill_graphify: path returns shortest-path result",
+      p_ok, f"rc={rc.returncode}")
+
+# rebuild_if_stale: should detect a fresh graph and skip.
+rc = run([sys.executable, str(BIN / "agent_skill_graphify.py"),
+          "rebuild_if_stale"], timeout=120)
+check("agent_skill_graphify: rebuild_if_stale exits 0 (graph fresh)",
+      rc.returncode == 0, f"rc={rc.returncode}")
+
 # Summary.
 print()
 if failures:
