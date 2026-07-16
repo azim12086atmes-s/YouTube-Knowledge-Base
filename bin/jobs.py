@@ -196,6 +196,16 @@ def _worker_analyze(payload: dict, job_id: int) -> None:
     ponytail: this worker knows about existing analyze.py — no new RAG,
     no new model logic. The job queue's job is to schedule and audit,
     not to rediscover analysis.
+
+    Modes (set via payload["mode"]):
+      - "transcript"   default. analyze.py fetches transcript + 4-shape
+                       Gemini prompts (~3s/video, free-tier quota-bound)
+      - "multimodal"   analyze.py --multimodal. Gemini watches the
+                       video (~11s/video, free-tier quota-bound)
+      - "ingest-raw"   analyze.py --ingest-raw --force. Local
+                       transcript + local embed, NO Gemini call
+                       (~1-2s/video, no rate limit, the right
+                       path for the 40k-URL walk)
     """
     url = payload["url"]
     mode = payload.get("mode", "transcript")
@@ -204,6 +214,8 @@ def _worker_analyze(payload: dict, job_id: int) -> None:
     cmd = [sys.executable, str(REPO / "bin" / "analyze.py"), url, "--out", out]
     if mode == "multimodal":
         cmd.append("--multimodal")
+    elif mode == "ingest-raw":
+        cmd.extend(["--ingest-raw", "--force"])
 
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     c = _conn()

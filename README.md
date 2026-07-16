@@ -98,6 +98,7 @@ Components:
 | `bin/backfill_watched_at.py` | One-shot repair for `watched_at:` front-matter. |
 | `bin/agent_loop.py` | "Do it yourself" cadence: surface unshipped D# rows + e2e status. Designed for cron-registered self-calls. |
 | `bin/agent_skill_graphify.py` | Project-typed wrapper around `graphify` (the repo-graph skill). Subcommands: rebuild, status, query, path, explain, affected, rebuild_if_stale. The next agent asks "where is X defined" without loading the whole repo. |
+| `bin/ingest_takeout.py` | Walk every `takeout-*.zip` in `~/Downloads/`, dedupe against the corpus index, enqueue not-yet-analyzed URLs into `jobs.sqlite` with `mode=ingest-raw`. Subcommands: status, enqueue, walk. The 40k-URL drain command. |
 | `bin/takeout_sample.py` | Back-compat alias of `url_source.py`. |
 
 ---
@@ -231,6 +232,17 @@ The default model is `gemini-3.1-flash-lite` (chat REPL + HTTP) or
 `gemini-flash-lite-latest` (analyze.py text path). Multimodal-mode
 analysis uses `gemini-3.1-flash-lite`. Models are documented in
 `bin/analyze.py`; switching is a one-line constant change.
+
+**Full model table** in `docs/ARCHITECTURE.md` under "Models
+in use (2026-07-16)." Three models, three roles: local
+`sentence-transformers/all-MiniLM-L6-v2` for embedding (free,
+no rate limit), Gemini for the 4-shape analysis + final
+answer (free tier: 50-200 calls/day, the binding constraint
+on the 4-shape path), and `youtube-transcript-api` for the
+caption fetch (lenient rate limit, the binding constraint
+on the `--ingest-raw` walk). The `--ingest-raw` mode bypasses
+Gemini entirely for the 40k-URL walk — see the
+"Takeout drain" Usage section below.
 
 ### Retrieval modes (vector vs. url-list)
 
@@ -618,6 +630,44 @@ agent can read it without re-invoking graphify. The
 agent session can invoke `/graphify .` to map any folder it
 lands in.
 
+### Takeout drain (the 40k-URL walk)
+
+The user has 6 `takeout-*.zip` files in `~/Downloads/`. 4 are
+pre-2024 (HTML format, not parsed by this script). 2 are
+JSON with 40,904 unique URLs total — 17 already analyzed,
+40,887 not yet. Use `bin/ingest_takeout.py` to drain the
+remaining URLs into the corpus:
+
+```bash
+# Step 1: status — see how many URLs are in each zip + format
+python bin/ingest_takeout.py status
+
+# Step 2: enqueue all not-yet-analyzed URLs into jobs.sqlite
+python bin/ingest_takeout.py enqueue
+
+# Step 3: dispatch in one shell, paced to YouTube's rate limit
+python bin/ingest_takeout.py walk --rate 5
+# ^ ~1s between requests, stays under the unauthenticated
+# caption API's ~200 req/min shared fingerprint.
+```
+
+**Or** run unattended: enqueue once, then the daemon drains
+the queue on a 20m interval:
+
+```bash
+python bin/ingest_takeout.py enqueue
+python bin/jobs.py daemon --interval 20m
+# runs forever; interrupt with Ctrl-C
+```
+
+The walker uses `mode=ingest-raw` (no Gemini call) for every
+URL, so the free-tier quota is not the binding constraint
+on the analysis side. YouTube's caption API rate is the only
+real limit. At 5 req/s, the 40k-URL walk takes ~2.3 hours of
+network time + local embed (~1s per chunk). Status surfaces
+the 4 HTML-only zips so the user can re-export them from
+Google Takeout if they want the older data too.
+
 ### Recovery operations
 
 ```bash
@@ -692,6 +742,7 @@ video-pipeline/
 │   ├── _gemini.py                  # shared POST helper for analyze/ask/chat
 │   ├── agent_loop.py               # "do it yourself" cadence: surface unshipped D#s
 │   ├── agent_skill_graphify.py     # repo-graph wrapper (subcommands: query / path / ...)
+│   ├── ingest_takeout.py           # walk takeout-*.zip; enqueue 40k URLs into jobs.sqlite (ingest-raw)
 │   ├── analyze.py                  # 1-URL → 4-shape Markdown + SQLite row
 │   ├── ask.py                      # single-turn RAG over chosen/all transcripts
 │   ├── backfill_watched_at.py      # repair watched_at front-matter from Takeout
