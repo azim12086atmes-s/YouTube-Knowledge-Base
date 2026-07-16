@@ -97,6 +97,7 @@ Components:
 | `bin/list.py` | Inventory CLI over the corpus index. |
 | `bin/backfill_watched_at.py` | One-shot repair for `watched_at:` front-matter. |
 | `bin/agent_loop.py` | "Do it yourself" cadence: surface unshipped D# rows + e2e status. Designed for cron-registered self-calls. |
+| `bin/agent_skill_graphify.py` | Project-typed wrapper around `graphify` (the repo-graph skill). Subcommands: rebuild, status, query, path, explain, affected, rebuild_if_stale. The next agent asks "where is X defined" without loading the whole repo. |
 | `bin/takeout_sample.py` | Back-compat alias of `url_source.py`. |
 
 ---
@@ -581,6 +582,42 @@ trigger has fired for a named D#.
 `AGENT_LOOP_SKIP_E2E=1` skips the e2e run inside the loop (useful
 for cron invocations that already know the e2e is green).
 
+### Repo graph (the next-agent substrate)
+
+The repo is mapped into a knowledge graph by
+[graphify](https://github.com/Graphify-Labs/graphify) (the
+PyPI package name is `graphifyy` to dodge a name collision).
+The next agent can ask "where is X defined" without loading
+the whole repo into context — graph.json has 240 nodes and 413
+edges on this 6.7k LOC project.
+
+```bash
+# Rebuild the graph from source (no API key needed — local AST)
+python bin/agent_skill_graphify.py rebuild_if_stale
+
+# What depends on a function?
+python bin/agent_skill_graphify.py affected "hybrid_search" --depth 2
+
+# Shortest path between two files
+python bin/agent_skill_graphify.py path "vector_store.py" "web.py"
+
+# BFS for a question
+python bin/agent_skill_graphify.py query "where is upsert_chunks defined"
+```
+
+Each subcommand writes a structured JSON result to
+`graphify-out/agent-skill-results.json` (gitignored) so the next
+agent can read it without re-invoking graphify. The
+`rebuild_if_stale` subcommand is the one to call from
+`bin/agent_loop.py` — it walks `bin/*.py` mtimes against
+`graph.json` mtime and rebuilds only when stale (~3s on this repo).
+
+`graphify` is also installed as a Hermes skill at
+`~/.hermes/skills/graphify/SKILL.md` (via
+`python -m graphify install --platform hermes`). The next
+agent session can invoke `/graphify .` to map any folder it
+lands in.
+
 ### Recovery operations
 
 ```bash
@@ -654,6 +691,7 @@ video-pipeline/
 ├── bin/
 │   ├── _gemini.py                  # shared POST helper for analyze/ask/chat
 │   ├── agent_loop.py               # "do it yourself" cadence: surface unshipped D#s
+│   ├── agent_skill_graphify.py     # repo-graph wrapper (subcommands: query / path / ...)
 │   ├── analyze.py                  # 1-URL → 4-shape Markdown + SQLite row
 │   ├── ask.py                      # single-turn RAG over chosen/all transcripts
 │   ├── backfill_watched_at.py      # repair watched_at front-matter from Takeout
